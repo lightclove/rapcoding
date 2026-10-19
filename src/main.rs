@@ -132,37 +132,12 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
     ));
 
     let base_dir = config_dir_of(&path);
-    let asr = asr::AsrBackend::new(&cfg.asr, &base_dir)?;
+    let model_dir = config::resolve_model_path(&base_dir, &cfg.asr.model);
+    let asr = asr::VoskAsr::new(&model_dir)?;
     if let Err(e) = asr.check() {
         logger.warn(&format!("asr not ready: {e} (recognition will fail)"));
     }
-    let asr_mixed = if cfg.general.mixed_hotkey.is_empty() {
-        None
-    } else {
-        match asr::AsrBackend::new_mixed(&cfg.asr, &base_dir) {
-            Ok(b) => Some(b),
-            Err(e) => {
-                logger.warn(&format!(
-                    "mixed backend not ready, second hotkey disabled: {e}"
-                ));
-                None
-            }
-        }
-    };
-    logger.debug(&format!(
-        "asr: backend={} model={} language={} threads={}; mixed: backend={} model={} hotkey={}",
-        cfg.asr.backend,
-        cfg.asr.model,
-        cfg.asr.language,
-        cfg.asr.threads,
-        cfg.asr.mixed_backend,
-        cfg.asr.mixed_model,
-        if asr_mixed.is_some() {
-            cfg.general.mixed_hotkey.as_str()
-        } else {
-            "disabled"
-        }
-    ));
+    logger.debug(&format!("asr: model={}", cfg.asr.model));
     let injector = inject::Injector::new(
         cfg.inject.enabled,
         &cfg.inject.method,
@@ -172,31 +147,18 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
     )?;
 
     let (hot_tx, hot_rx) = mpsc::channel::<hotkey::HotMsg>();
-    let mixed_hotkey_opt = if asr_mixed.is_some() {
-        Some(cfg.general.mixed_hotkey.as_str())
-    } else {
-        None
-    };
-    let _hk = hotkey::spawn_hotkeys(&cfg.general.hotkey, mixed_hotkey_opt, hot_tx)?;
+    let _hk = hotkey::spawn_hotkey(&cfg.general.hotkey, hot_tx)?;
     logger.info(&format!(
-        "hotkey '{}' registered (mode {}); mixed hotkey '{}' ({})",
-        cfg.general.hotkey,
-        cfg.general.mode,
-        cfg.general.mixed_hotkey,
-        if asr_mixed.is_some() {
-            cfg.asr.mixed_backend.as_str()
-        } else {
-            "disabled"
-        }
+        "hotkey '{}' registered (mode {})",
+        cfg.general.hotkey, cfg.general.mode
     ));
 
     let (work_tx, work_rx) = mpsc::channel::<WorkResult>();
     let busy = Arc::new(AtomicBool::new(false));
     let max = Duration::from_secs(cfg.general.max_record_secs.max(1));
     let mut recording = false;
-    let mut recording_mixed = false;
 
-    let dispatch = |samples: Vec<f32>, backend: &asr::AsrBackend| {
+    let dispatch = |samples: Vec<f32>| {
         if samples.is_empty() {
             return;
         }
@@ -206,7 +168,7 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
             samples,
             audio.device_rate(),
             cfg.clone(),
-            backend.clone(),
+            asr.clone(),
             injector.clone(),
             logger.clone(),
             work_tx.clone(),
@@ -222,55 +184,36 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
                     fatal = Some(e);
                     break;
                 }
-                hotkey::HotMsg::Event { mixed, state } => {
-                    let backend = if mixed {
-                        asr_mixed
-                            .as_ref()
-                            .expect("mixed hotkey fired without backend")
-                    } else {
-                        &asr
-                    };
-                    match (mode, state) {
-                        (Mode::Hold, hotkey::HotEvent::Pressed) => {
-                            if busy.load(Ordering::Relaxed) {
-                                logger.warn("busy: ignoring hotkey");
-                            } else if !recording {
-                                audio.start();
-                                recording = true;
-                                recording_mixed = mixed;
-                                logger.info(if mixed {
-                                    "listening (mixed RU/EN)"
-                                } else {
-                                    "listening"
-                                });
-                            }
+                hotkey::HotMsg::Event(ev) => match (mode, ev) {
+                    (Mode::Hold, hotkey::HotEvent::Pressed) => {
+                        if busy.load(Ordering::Relaxed) {
+                            logger.warn("busy: ignoring hotkey");
+                        } else if !recording {
+                            audio.start();
+                            recording = true;
+                            logger.info("listening");
                         }
-                        (Mode::Hold, hotkey::HotEvent::Released) => {
-                            if recording {
-                                recording = false;
-                                dispatch(audio.stop(), backend);
-                            }
-                        }
-                        (Mode::Toggle, hotkey::HotEvent::Pressed) => {
-                            if recording {
-                                recording = false;
-                                dispatch(audio.stop(), backend);
-                            } else if busy.load(Ordering::Relaxed) {
-                                logger.warn("busy: ignoring hotkey");
-                            } else {
-                                audio.start();
-                                recording = true;
-                                recording_mixed = mixed;
-                                logger.info(if mixed {
-                                    "listening (mixed RU/EN)"
-                                } else {
-                                    "listening"
-                                });
-                            }
-                        }
-                        (_, hotkey::HotEvent::Released) => {}
                     }
-                }
+                    (Mode::Hold, hotkey::HotEvent::Released) => {
+                        if recording {
+                            recording = false;
+                            dispatch(audio.stop());
+                        }
+                    }
+                    (Mode::Toggle, hotkey::HotEvent::Pressed) => {
+                        if recording {
+                            recording = false;
+                            dispatch(audio.stop());
+                        } else if busy.load(Ordering::Relaxed) {
+                            logger.warn("busy: ignoring hotkey");
+                        } else {
+                            audio.start();
+                            recording = true;
+                            logger.info("listening");
+                        }
+                    }
+                    (_, hotkey::HotEvent::Released) => {}
+                },
             }
         }
         if let Some(e) = fatal {
@@ -296,12 +239,7 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
                 if el >= max {
                     recording = false;
                     logger.info("auto-stop at max duration");
-                    let backend = if recording_mixed {
-                        asr_mixed.as_ref().expect("mixed backend missing")
-                    } else {
-                        &asr
-                    };
-                    dispatch(audio.stop(), backend);
+                    dispatch(audio.stop());
                 }
             }
         }
@@ -314,7 +252,7 @@ fn spawn_worker(
     samples: Vec<f32>,
     rate: u32,
     cfg: config::Config,
-    asr: asr::AsrBackend,
+    asr: asr::VoskAsr,
     injector: inject::Injector,
     logger: Logger,
     tx: Sender<WorkResult>,
@@ -329,7 +267,7 @@ fn process_utterance(
     samples: Vec<f32>,
     rate: u32,
     cfg: &config::Config,
-    asr: &asr::AsrBackend,
+    asr: &asr::VoskAsr,
     injector: &inject::Injector,
     logger: &Logger,
 ) -> WorkResult {
@@ -357,7 +295,7 @@ fn process_utterance(
     ));
 
     let t0 = Instant::now();
-    let raw = match transcribe_with(asr, &speech, cfg.asr.keep_wav, logger) {
+    let raw = match asr.transcribe_samples(&speech) {
         Ok(s) => s,
         Err(e) => {
             return fail(format!("asr: {e}"));
@@ -392,33 +330,6 @@ fn process_utterance(
         asr_ms,
         inject_ms,
         message: note,
-    }
-}
-
-fn transcribe_with(
-    asr: &asr::AsrBackend,
-    speech: &[f32],
-    keep_wav: bool,
-    logger: &Logger,
-) -> error::Result<String> {
-    match asr {
-        asr::AsrBackend::Whisper(w) => {
-            let wav_path =
-                std::env::temp_dir().join(format!("rapcoding-{}.wav", std::process::id()));
-            wav::write_wav(&wav_path, speech)?;
-            let r = w.transcribe(&wav_path);
-            cleanup_wav(&wav_path, keep_wav, logger);
-            r
-        }
-        asr::AsrBackend::Vosk(v) => v.transcribe_samples(speech),
-    }
-}
-
-fn cleanup_wav(path: &Path, keep: bool, logger: &Logger) {
-    if keep {
-        logger.info(&format!("captured audio kept: {}", path.display()));
-    } else {
-        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -481,9 +392,9 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
         }
     }
 
-    match asr::AsrBackend::new(&cfg.asr, &base_dir) {
+    match asr::VoskAsr::new(&config::resolve_model_path(&base_dir, &cfg.asr.model)) {
         Ok(a) => match a.check() {
-            Ok(()) => println!("  ok: asr backend '{}' + model present", cfg.asr.backend),
+            Ok(()) => println!("  ok: asr model '{}' present", cfg.asr.model),
             Err(e) => {
                 println!("  FAIL: {e}");
                 ok = false;
@@ -492,34 +403,6 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
         Err(e) => {
             println!("  FAIL: {e}");
             ok = false;
-        }
-    }
-
-    if cfg.general.mixed_hotkey.is_empty() {
-        println!("  note: mixed RU/EN hotkey disabled (general.mixed_hotkey = \"\")");
-    } else {
-        match hotkey::parse_hotkey(&cfg.general.mixed_hotkey) {
-            Ok(_) => println!("  ok: general.mixed_hotkey = {}", cfg.general.mixed_hotkey),
-            Err(e) => {
-                println!("  FAIL: {e}");
-                ok = false;
-            }
-        }
-        match asr::AsrBackend::new_mixed(&cfg.asr, &base_dir) {
-            Ok(a) => match a.check() {
-                Ok(()) => println!(
-                    "  ok: mixed asr backend '{}' + model present",
-                    cfg.asr.mixed_backend
-                ),
-                Err(e) => {
-                    println!("  FAIL: {e}");
-                    ok = false;
-                }
-            },
-            Err(e) => {
-                println!("  FAIL: {e}");
-                ok = false;
-            }
         }
     }
 
@@ -577,16 +460,12 @@ fn cmd_transcribe(override_path: Option<&Path>, wav: &Path) -> Result<i32> {
     let path = config::config_path(override_path);
     let cfg = config::load(&path)?;
     let base_dir = config_dir_of(&path);
-    let asr = asr::AsrBackend::new(&cfg.asr, &base_dir)?;
+    let model_dir = config::resolve_model_path(&base_dir, &cfg.asr.model);
+    let asr = asr::VoskAsr::new(&model_dir)?;
     asr.check()?;
     println!("transcribing {} …", wav.display());
     let samples = wav::read_wav(wav)?;
-    let logger = Logger::new(
-        config::config_dir().join("rapcoding.log"),
-        Level::Info,
-        false,
-    )?;
-    let raw = transcribe_with(&asr, &samples, false, &logger)?;
+    let raw = asr.transcribe_samples(&samples)?;
     let text = text::postprocess(
         &raw,
         &cfg.text.voice_commands,

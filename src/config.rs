@@ -22,7 +22,6 @@ pub struct Config {
 pub struct General {
     pub mode: String,
     pub hotkey: String,
-    pub mixed_hotkey: String,
     pub max_record_secs: u64,
     pub log_transcripts: bool,
 }
@@ -40,17 +39,7 @@ pub struct Audio {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Asr {
-    pub backend: String,
-    pub command: String,
     pub model: String,
-    pub mixed_backend: String,
-    pub mixed_model: String,
-    pub language: String,
-    pub threads: u32,
-    pub timeout_secs: u64,
-    pub initial_prompt: String,
-    pub keep_wav: bool,
-    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -88,7 +77,6 @@ impl Default for General {
         General {
             mode: "hold".into(),
             hotkey: "ctrl+alt+space".into(),
-            mixed_hotkey: "ctrl+alt+shift+space".into(),
             max_record_secs: 120,
             log_transcripts: false,
         }
@@ -110,33 +98,7 @@ impl Default for Audio {
 impl Default for Asr {
     fn default() -> Self {
         Asr {
-            backend: "vosk".into(),
-            command: "whisper-cli".into(),
             model: "models/vosk-model-small-ru-0.22".into(),
-            mixed_backend: "sidecar".into(),
-            mixed_model: "models/ggml-small-q5_1.bin".into(),
-            language: "ru".into(),
-            threads: 0,
-            timeout_secs: 60,
-            initial_prompt: String::new(),
-            keep_wav: false,
-            args: vec![
-                "-m".into(),
-                "{model}".into(),
-                "-f".into(),
-                "{wav}".into(),
-                "-l".into(),
-                "{language}".into(),
-                "-t".into(),
-                "{threads}".into(),
-                "-nt".into(),
-                "-otxt".into(),
-                "-of".into(),
-                "{out_base}".into(),
-                "--prompt".into(),
-                "{prompt}".into(),
-                "-np".into(),
-            ],
         }
     }
 }
@@ -185,26 +147,6 @@ impl Config {
             return Err(Error::Config(
                 "audio.silence_threshold must be in [0, 1)".into(),
             ));
-        }
-        if !matches!(self.asr.backend.as_str(), "sidecar" | "vosk") {
-            return Err(Error::Config(format!(
-                "asr.backend '{}' unsupported ('sidecar' | 'vosk')",
-                self.asr.backend
-            )));
-        }
-        if !self.general.mixed_hotkey.is_empty()
-            && !matches!(self.asr.mixed_backend.as_str(), "sidecar" | "vosk")
-        {
-            return Err(Error::Config(format!(
-                "asr.mixed_backend '{}' unsupported ('sidecar' | 'vosk')",
-                self.asr.mixed_backend
-            )));
-        }
-        if self.asr.args.is_empty() {
-            return Err(Error::Config("asr.args must not be empty".into()));
-        }
-        if self.asr.timeout_secs == 0 {
-            return Err(Error::Config("asr.timeout_secs must be > 0".into()));
         }
         if !matches!(
             self.text.voice_commands.as_str(),
@@ -288,7 +230,7 @@ pub fn load(path: &Path) -> Result<Config> {
 }
 
 /// Resolve a relative path (e.g. the model) against config dir, cwd, then exe dir.
-pub fn resolve_sidecar_path(cfg_dir: &Path, rel: &str) -> PathBuf {
+pub fn resolve_model_path(cfg_dir: &Path, rel: &str) -> PathBuf {
     let p = Path::new(rel);
     if p.is_absolute() {
         return p.to_path_buf();
@@ -335,22 +277,5 @@ mod tests {
         Config::default()
             .validate()
             .expect("defaults must be valid");
-    }
-
-    #[test]
-    fn invalid_mixed_backend_rejected() {
-        let mut c = Config::default();
-        c.asr.mixed_backend = "bogus".into();
-        assert!(c.validate().is_err());
-    }
-
-    #[test]
-    fn default_prompt_is_empty_to_avoid_hallucination() {
-        // Regression: a non-empty --prompt makes whisper.cpp hallucinate on
-        // short utterances (observed: "Как ты?" -> "❤️"). Keep it empty.
-        assert!(
-            Config::default().asr.initial_prompt.is_empty(),
-            "default initial_prompt must be empty"
-        );
     }
 }

@@ -3,7 +3,7 @@ name = "rapcoding"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Low-latency push-to-talk voice input for code and prompts (Whisper sidecar)"
+description = "Low-latency push-to-talk voice input for code and prompts (local Vosk ASR)"
 license = "MIT"
 
 [dependencies]

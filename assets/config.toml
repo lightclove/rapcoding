@@ -3,8 +3,7 @@
 
 [general]
 mode = "hold"              # "hold" (push-to-talk) | "toggle"
-hotkey = "ctrl+alt+space"  # primary hotkey (fast RU backend)
-mixed_hotkey = "ctrl+alt+shift+space"  # second hotkey (mixed RU/EN backend); "" disables
+hotkey = "ctrl+alt+space"  # global hotkey (e.g. "f9", "ctrl+shift+f10")
 max_record_secs = 120      # hard stop to avoid runaway recording
 log_transcripts = false    # privacy: keep recognized text out of the log
 
@@ -16,27 +15,7 @@ silence_padding_ms = 200   # silence kept around detected speech
 min_speech_ms = 250        # reject shorter utterances as noise
 
 [asr]
-backend = "vosk"           # primary hotkey backend: "vosk" (RU, ~1 s) | "sidecar" (whisper, RU/EN)
-model = "models/vosk-model-small-ru-0.22"  # relative to config dir, exe dir, or cwd
-mixed_backend = "sidecar"  # backend for mixed_hotkey: "sidecar" | "vosk"
-mixed_model = "models/ggml-small-q5_1.bin"  # model for mixed_hotkey
-command = "whisper-cli"    # on PATH, or an absolute path to the binary
-language = "ru"            # "ru" | "en" | "auto" | any whisper language code (whisper backends)
-threads = 0                # 0 = auto (half of logical cores, min 1)
-timeout_secs = 60          # kill the ASR process after this many seconds
-initial_prompt = ""      # non-empty --prompt makes whisper hallucinate on short phrases; keep empty
-keep_wav = false           # true = save the captured WAV to %TEMP% for listening
-args = [
-  "-m", "{model}",
-  "-f", "{wav}",
-  "-l", "{language}",
-  "-t", "{threads}",
-  "-nt",
-  "-otxt",
-  "-of", "{out_base}",
-  "--prompt", "{prompt}",
-  "-np",
-]
+model = "models/vosk-model-small-ru-0.22"  # relative to config dir, exe dir, or cwd (unpacked model dir)
 
 [text]
 voice_commands = "safe"    # "off" | "safe" (multi-word) | "aggressive" (adds single-word)

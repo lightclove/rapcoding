@@ -1,14 +1,15 @@
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
 
-/// Write mono 16 kHz 16-bit PCM WAV (the format whisper-cli expects).
+/// Write mono 16 kHz 16-bit PCM WAV. Used by tests (the live pipeline feeds
+/// vosk samples directly, no WAV round-trip).
+#[cfg(test)]
 pub fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
+    use std::io::Write;
     let n = samples.len();
     let data_len = (n * 2) as u32;
-    let mut w = BufWriter::new(File::create(path)?);
+    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
 
     w.write_all(b"RIFF")?;
     w.write_all(&(36 + data_len).to_le_bytes())?;
