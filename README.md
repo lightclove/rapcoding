@@ -205,6 +205,54 @@ https://huggingface.co/ggerganov/whisper.cpp (файл `ggml-small-q5_1.bin`).
 - **Linux.** Работает только в окружении X11. В Wayland глобальные хоткеи
   запрещены системой.
 
+## Карта проекта (для разработчиков)
+
+Входная точка — `src/main.rs`: CLI, цикл событий, пайплайн фразы.
+
+```
+src/main.rs        CLI + цикл событий + пайплайн фразы
+src/audio.rs       захват микрофона (cpal): downmix, resample 48к→16к, обрезка тишины
+src/asr.rs         бэкенды распознавания: SidecarAsr (whisper-cli) | VoskAsr (vosk-rs)
+src/inject.rs      вставка: type (enigo, прямой ввод) | paste (arboard + хорда)
+src/text.rs        постобработка: звуковые теги, голосовые команды, пунктуация
+src/hotkey.rs      global-hotkey + Win32 message pump, hold/toggle
+src/config.rs      TOML-конфиг, дефолты, валидация
+src/wav.rs         WAV: запись/чтение (16 кГц PCM)
+src/log.rs         лог с ротацией (5 МБ)
+src/error.rs       единый тип ошибок
+assets/config.toml канонический шаблон конфига
+build.rs           link-search для libvosk.lib
+lib/vosk/          libvosk.lib (линковка на Windows)
+```
+
+Поток данных на фразу: hotkey → AudioCapture (48 кГц моно) → resample 16 кГц →
+trim_silence → AsrBackend → postprocess → Injector → активное окно.
+
+Ключевые зависимости: cpal, global-hotkey, crossbeam-channel, enigo, arboard,
+serde, toml, thiserror, vosk (+ windows-sys под Windows).
+
+Сборка и проверка:
+
+```
+cargo build --release   # бинарь ~600 КБ
+cargo test              # 33 теста
+rapcoding check         # проверка окружения
+```
+
+Нюансы реализации:
+
+- Vosk: модель грузится один раз при старте демона и живёт в памяти
+  (~1 с на фразу).
+- Whisper: sidecar-процесс на каждую фразу (медленнее, зато RU/EN).
+- `libvosk.dll` и зависимые DLL должны лежать рядом с exe; `libvosk.lib` нужен
+  только при линковке.
+- Аудио-колбэк lock-free (crossbeam): мьютекс и аллокации в real-time колбэке
+  дают WASAPI buffer underrun.
+- Конфиг читается один раз при старте; смена настроек требует рестарта.
+
+Release-профиль: `opt-level="z"`, `lto="fat"`, `codegen-units=1`,
+`panic="abort"`, `strip=true`.
+
 ## Остальное
 
 - Распознавание локальное: звук с микрофона никуда не отправляется.
