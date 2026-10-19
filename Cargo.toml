@@ -1,0 +1,28 @@
+[package]
+name = "rapcoding"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Low-latency push-to-talk voice input for code and prompts (Whisper sidecar)"
+license = "MIT"
+
+[dependencies]
+arboard = { version = "3.7", default-features = false }
+cpal = "0.18"
+crossbeam-channel = "0.5"
+enigo = "0.6"
+global-hotkey = "0.9"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
+vosk = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
