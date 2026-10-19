@@ -17,7 +17,8 @@ pub enum HotEvent {
 /// Message sent from the hotkey thread to the main loop.
 #[derive(Debug)]
 pub enum HotMsg {
-    Event(HotEvent),
+    /// `mixed` = second hotkey (RU/EN backend), `false` = primary hotkey.
+    Event { mixed: bool, state: HotEvent },
     /// Registration/thread failure — surfaces so the app does not run silent.
     Fatal(String),
 }
@@ -30,8 +31,19 @@ pub fn parse_hotkey(s: &str) -> Result<HotKey> {
 
 /// Spawn the hotkey manager + message loop on a dedicated thread.
 /// On Windows a Win32 message pump is required for `WM_HOTKEY` delivery.
-pub fn spawn_hotkey(hotkey: &str, tx: Sender<HotMsg>) -> Result<JoinHandle<()>> {
-    let hotkey = parse_hotkey(hotkey)?;
+/// `mixed` is the optional second hotkey (empty string disables it).
+pub fn spawn_hotkeys(
+    primary: &str,
+    mixed: Option<&str>,
+    tx: Sender<HotMsg>,
+) -> Result<JoinHandle<()>> {
+    let primary = parse_hotkey(primary)?;
+    let mixed = match mixed {
+        Some(s) if !s.is_empty() => Some(parse_hotkey(s)?),
+        _ => None,
+    };
+    let primary_id = primary.id();
+    let mixed_id = mixed.as_ref().map(|m| m.id());
 
     std::thread::Builder::new()
         .name("rapcoding-hotkey".into())
@@ -43,19 +55,29 @@ pub fn spawn_hotkey(hotkey: &str, tx: Sender<HotMsg>) -> Result<JoinHandle<()>> 
                     return;
                 }
             };
-            if let Err(e) = manager.register(hotkey) {
+            if let Err(e) = manager.register(primary) {
                 let _ = tx.send(HotMsg::Fatal(format!("hotkey register: {e}")));
                 return;
+            }
+            if let Some(m) = mixed {
+                if let Err(e) = manager.register(m) {
+                    let _ = tx.send(HotMsg::Fatal(format!("mixed hotkey register: {e}")));
+                    return;
+                }
             }
             loop {
                 pump_messages();
                 while let Ok(ev) = GlobalHotKeyEvent::receiver().try_recv() {
+                    let mixed = mixed_id == Some(ev.id);
+                    if ev.id != primary_id && !mixed {
+                        continue;
+                    }
                     let state = if ev.state == HotKeyState::Pressed {
                         HotEvent::Pressed
                     } else {
                         HotEvent::Released
                     };
-                    if tx.send(HotMsg::Event(state)).is_err() {
+                    if tx.send(HotMsg::Event { mixed, state }).is_err() {
                         return;
                     }
                 }

@@ -136,9 +136,32 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
     if let Err(e) = asr.check() {
         logger.warn(&format!("asr not ready: {e} (recognition will fail)"));
     }
+    let asr_mixed = if cfg.general.mixed_hotkey.is_empty() {
+        None
+    } else {
+        match asr::AsrBackend::new_mixed(&cfg.asr, &base_dir) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                logger.warn(&format!(
+                    "mixed backend not ready, second hotkey disabled: {e}"
+                ));
+                None
+            }
+        }
+    };
     logger.debug(&format!(
-        "asr: backend={} model={} language={} threads={}",
-        cfg.asr.backend, cfg.asr.model, cfg.asr.language, cfg.asr.threads
+        "asr: backend={} model={} language={} threads={}; mixed: backend={} model={} hotkey={}",
+        cfg.asr.backend,
+        cfg.asr.model,
+        cfg.asr.language,
+        cfg.asr.threads,
+        cfg.asr.mixed_backend,
+        cfg.asr.mixed_model,
+        if asr_mixed.is_some() {
+            cfg.general.mixed_hotkey.as_str()
+        } else {
+            "disabled"
+        }
     ));
     let injector = inject::Injector::new(
         cfg.inject.enabled,
@@ -149,18 +172,31 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
     )?;
 
     let (hot_tx, hot_rx) = mpsc::channel::<hotkey::HotMsg>();
-    let _hk = hotkey::spawn_hotkey(&cfg.general.hotkey, hot_tx)?;
+    let mixed_hotkey_opt = if asr_mixed.is_some() {
+        Some(cfg.general.mixed_hotkey.as_str())
+    } else {
+        None
+    };
+    let _hk = hotkey::spawn_hotkeys(&cfg.general.hotkey, mixed_hotkey_opt, hot_tx)?;
     logger.info(&format!(
-        "hotkey '{}' registered (mode {})",
-        cfg.general.hotkey, cfg.general.mode
+        "hotkey '{}' registered (mode {}); mixed hotkey '{}' ({})",
+        cfg.general.hotkey,
+        cfg.general.mode,
+        cfg.general.mixed_hotkey,
+        if asr_mixed.is_some() {
+            cfg.asr.mixed_backend.as_str()
+        } else {
+            "disabled"
+        }
     ));
 
     let (work_tx, work_rx) = mpsc::channel::<WorkResult>();
     let busy = Arc::new(AtomicBool::new(false));
     let max = Duration::from_secs(cfg.general.max_record_secs.max(1));
     let mut recording = false;
+    let mut recording_mixed = false;
 
-    let dispatch = |samples: Vec<f32>| {
+    let dispatch = |samples: Vec<f32>, backend: &asr::AsrBackend| {
         if samples.is_empty() {
             return;
         }
@@ -170,7 +206,7 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
             samples,
             audio.device_rate(),
             cfg.clone(),
-            asr.clone(),
+            backend.clone(),
             injector.clone(),
             logger.clone(),
             work_tx.clone(),
@@ -186,36 +222,55 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
                     fatal = Some(e);
                     break;
                 }
-                hotkey::HotMsg::Event(ev) => match (mode, ev) {
-                    (Mode::Hold, hotkey::HotEvent::Pressed) => {
-                        if busy.load(Ordering::Relaxed) {
-                            logger.warn("busy: ignoring hotkey");
-                        } else if !recording {
-                            audio.start();
-                            recording = true;
-                            logger.info("listening");
+                hotkey::HotMsg::Event { mixed, state } => {
+                    let backend = if mixed {
+                        asr_mixed
+                            .as_ref()
+                            .expect("mixed hotkey fired without backend")
+                    } else {
+                        &asr
+                    };
+                    match (mode, state) {
+                        (Mode::Hold, hotkey::HotEvent::Pressed) => {
+                            if busy.load(Ordering::Relaxed) {
+                                logger.warn("busy: ignoring hotkey");
+                            } else if !recording {
+                                audio.start();
+                                recording = true;
+                                recording_mixed = mixed;
+                                logger.info(if mixed {
+                                    "listening (mixed RU/EN)"
+                                } else {
+                                    "listening"
+                                });
+                            }
                         }
-                    }
-                    (Mode::Hold, hotkey::HotEvent::Released) => {
-                        if recording {
-                            recording = false;
-                            dispatch(audio.stop());
+                        (Mode::Hold, hotkey::HotEvent::Released) => {
+                            if recording {
+                                recording = false;
+                                dispatch(audio.stop(), backend);
+                            }
                         }
-                    }
-                    (Mode::Toggle, hotkey::HotEvent::Pressed) => {
-                        if recording {
-                            recording = false;
-                            dispatch(audio.stop());
-                        } else if busy.load(Ordering::Relaxed) {
-                            logger.warn("busy: ignoring hotkey");
-                        } else {
-                            audio.start();
-                            recording = true;
-                            logger.info("listening");
+                        (Mode::Toggle, hotkey::HotEvent::Pressed) => {
+                            if recording {
+                                recording = false;
+                                dispatch(audio.stop(), backend);
+                            } else if busy.load(Ordering::Relaxed) {
+                                logger.warn("busy: ignoring hotkey");
+                            } else {
+                                audio.start();
+                                recording = true;
+                                recording_mixed = mixed;
+                                logger.info(if mixed {
+                                    "listening (mixed RU/EN)"
+                                } else {
+                                    "listening"
+                                });
+                            }
                         }
+                        (_, hotkey::HotEvent::Released) => {}
                     }
-                    (_, hotkey::HotEvent::Released) => {}
-                },
+                }
             }
         }
         if let Some(e) = fatal {
@@ -241,7 +296,12 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
                 if el >= max {
                     recording = false;
                     logger.info("auto-stop at max duration");
-                    dispatch(audio.stop());
+                    let backend = if recording_mixed {
+                        asr_mixed.as_ref().expect("mixed backend missing")
+                    } else {
+                        &asr
+                    };
+                    dispatch(audio.stop(), backend);
                 }
             }
         }
@@ -432,6 +492,34 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
         Err(e) => {
             println!("  FAIL: {e}");
             ok = false;
+        }
+    }
+
+    if cfg.general.mixed_hotkey.is_empty() {
+        println!("  note: mixed RU/EN hotkey disabled (general.mixed_hotkey = \"\")");
+    } else {
+        match hotkey::parse_hotkey(&cfg.general.mixed_hotkey) {
+            Ok(_) => println!("  ok: general.mixed_hotkey = {}", cfg.general.mixed_hotkey),
+            Err(e) => {
+                println!("  FAIL: {e}");
+                ok = false;
+            }
+        }
+        match asr::AsrBackend::new_mixed(&cfg.asr, &base_dir) {
+            Ok(a) => match a.check() {
+                Ok(()) => println!(
+                    "  ok: mixed asr backend '{}' + model present",
+                    cfg.asr.mixed_backend
+                ),
+                Err(e) => {
+                    println!("  FAIL: {e}");
+                    ok = false;
+                }
+            },
+            Err(e) => {
+                println!("  FAIL: {e}");
+                ok = false;
+            }
         }
     }
 

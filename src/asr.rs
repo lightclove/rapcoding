@@ -305,6 +305,26 @@ impl AsrBackend {
         }
     }
 
+    /// Backend for the mixed RU/EN hotkey. Whisper-sidecar fields (command,
+    /// args, language, threads, timeout, prompt) are shared with the primary
+    /// config; only the backend kind and model differ.
+    pub fn new_mixed(cfg: &AsrCfg, cfg_dir: &Path) -> Result<Self> {
+        match cfg.mixed_backend.as_str() {
+            "sidecar" => {
+                let mut c = cfg.clone();
+                c.model = cfg.mixed_model.clone();
+                Ok(AsrBackend::Whisper(SidecarAsr::new(c, cfg_dir)))
+            }
+            "vosk" => {
+                let model_dir = config::resolve_sidecar_path(cfg_dir, &cfg.mixed_model);
+                Ok(AsrBackend::Vosk(VoskAsr::new(&model_dir)?))
+            }
+            other => Err(Error::Config(format!(
+                "unsupported asr.mixed_backend '{other}' ('sidecar' | 'vosk')"
+            ))),
+        }
+    }
+
     pub fn check(&self) -> Result<()> {
         match self {
             AsrBackend::Whisper(w) => w.check(),

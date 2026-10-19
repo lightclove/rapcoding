@@ -22,6 +22,7 @@ pub struct Config {
 pub struct General {
     pub mode: String,
     pub hotkey: String,
+    pub mixed_hotkey: String,
     pub max_record_secs: u64,
     pub log_transcripts: bool,
 }
@@ -42,6 +43,8 @@ pub struct Asr {
     pub backend: String,
     pub command: String,
     pub model: String,
+    pub mixed_backend: String,
+    pub mixed_model: String,
     pub language: String,
     pub threads: u32,
     pub timeout_secs: u64,
@@ -85,6 +88,7 @@ impl Default for General {
         General {
             mode: "hold".into(),
             hotkey: "ctrl+alt+space".into(),
+            mixed_hotkey: "ctrl+alt+shift+space".into(),
             max_record_secs: 120,
             log_transcripts: false,
         }
@@ -106,10 +110,12 @@ impl Default for Audio {
 impl Default for Asr {
     fn default() -> Self {
         Asr {
-            backend: "sidecar".into(),
+            backend: "vosk".into(),
             command: "whisper-cli".into(),
-            model: "models/ggml-large-v3-turbo-q5_0.bin".into(),
-            language: "auto".into(),
+            model: "models/vosk-model-small-ru-0.22".into(),
+            mixed_backend: "sidecar".into(),
+            mixed_model: "models/ggml-small-q5_1.bin".into(),
+            language: "ru".into(),
             threads: 0,
             timeout_secs: 60,
             initial_prompt: String::new(),
@@ -184,6 +190,14 @@ impl Config {
             return Err(Error::Config(format!(
                 "asr.backend '{}' unsupported ('sidecar' | 'vosk')",
                 self.asr.backend
+            )));
+        }
+        if !self.general.mixed_hotkey.is_empty()
+            && !matches!(self.asr.mixed_backend.as_str(), "sidecar" | "vosk")
+        {
+            return Err(Error::Config(format!(
+                "asr.mixed_backend '{}' unsupported ('sidecar' | 'vosk')",
+                self.asr.mixed_backend
             )));
         }
         if self.asr.args.is_empty() {
@@ -321,6 +335,13 @@ mod tests {
         Config::default()
             .validate()
             .expect("defaults must be valid");
+    }
+
+    #[test]
+    fn invalid_mixed_backend_rejected() {
+        let mut c = Config::default();
+        c.asr.mixed_backend = "bogus".into();
+        assert!(c.validate().is_err());
     }
 
     #[test]
