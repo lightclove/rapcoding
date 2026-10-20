@@ -98,16 +98,12 @@ impl AudioCapture {
         // Drain any stale chunks from a previous (unfinished) recording.
         while self.shared.rx.try_recv().is_ok() {}
         self.shared.recording.store(true, Ordering::Relaxed);
-        if let Ok(mut st) = self.shared.start.lock() {
-            *st = Some(Instant::now());
-        }
+        *crate::sync::lock_recover(&self.shared.start) = Some(Instant::now());
     }
 
     pub fn stop(&self) -> Vec<f32> {
         self.shared.recording.store(false, Ordering::Relaxed);
-        if let Ok(mut st) = self.shared.start.lock() {
-            *st = None;
-        }
+        *crate::sync::lock_recover(&self.shared.start) = None;
         let mut out = Vec::new();
         while let Ok(chunk) = self.shared.rx.try_recv() {
             out.extend_from_slice(&chunk);
@@ -116,11 +112,9 @@ impl AudioCapture {
     }
 
     pub fn elapsed(&self) -> Option<Duration> {
-        self.shared
-            .start
-            .lock()
-            .ok()
-            .and_then(|s| s.as_ref().map(|i| i.elapsed()))
+        crate::sync::lock_recover(&self.shared.start)
+            .as_ref()
+            .map(|i| i.elapsed())
     }
 
     pub fn device_rate(&self) -> u32 {
@@ -252,7 +246,7 @@ pub fn trim_silence(input: &[f32], threshold: f32, padding_samples: usize) -> Ve
         None => Vec::new(),
         Some((a, b)) => {
             let start = a.saturating_sub(padding_samples);
-            let end = (b + padding_samples).min(input.len());
+            let end = (b + 1 + padding_samples).min(input.len());
             input[start..end].to_vec()
         }
     }
@@ -303,7 +297,7 @@ mod tests {
     fn trim_silence_pads() {
         let input = vec![0.0, 0.0, 0.9, 0.0, 0.0, 0.0];
         let out = trim_silence(&input, 0.1, 1);
-        assert_eq!(out, vec![0.0, 0.9]);
+        assert_eq!(out, vec![0.0, 0.9, 0.0]);
     }
 
     #[test]

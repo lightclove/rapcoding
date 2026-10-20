@@ -77,27 +77,40 @@ impl Injector {
             Method::Paste => {
                 let mut clip = arboard::Clipboard::new()
                     .map_err(|e| Error::Inject(format!("clipboard: {e}")))?;
-                let prev: Option<String> = clip.get_text().ok();
-                let had_text = prev.is_some();
-                clip.set_text(text)
-                    .map_err(|e| Error::Inject(format!("set clipboard: {e}")))?;
+                // Preserve prior text; detect non-text content (image/file)
+                // which we must not clobber.
+                match clip.get_text() {
+                    Ok(prev) => {
+                        let had_text = !prev.is_empty();
+                        clip.set_text(text)
+                            .map_err(|e| Error::Inject(format!("set clipboard: {e}")))?;
 
-                let mut e = Enigo::new(&Settings::default())
-                    .map_err(|e| Error::Inject(format!("enigo init: {e}")))?;
-                send_chord(&mut e, self.chord)?;
-                std::thread::sleep(self.settle);
+                        let mut e = Enigo::new(&Settings::default())
+                            .map_err(|e| Error::Inject(format!("enigo init: {e}")))?;
+                        send_chord(&mut e, self.chord)?;
+                        std::thread::sleep(self.settle);
 
-                let note = if self.restore_clipboard {
-                    if had_text {
-                        let _ = clip.set_text(prev.as_deref().unwrap_or(""));
-                        "clipboard restored".to_string()
-                    } else {
-                        "clipboard left as text (no prior text to restore)".to_string()
+                        let note = if self.restore_clipboard {
+                            if had_text {
+                                let _ = clip.set_text(&prev);
+                                "clipboard restored".to_string()
+                            } else {
+                                "clipboard left as text (no prior text to restore)".to_string()
+                            }
+                        } else {
+                            "clipboard left as recognized text".to_string()
+                        };
+                        Ok(format!("paste ({})", note))
                     }
-                } else {
-                    "clipboard left as recognized text".to_string()
-                };
-                Ok(format!("paste ({})", note))
+                    Err(_) => {
+                        // Non-text content (image/file): typing avoids destroying it.
+                        let mut e = Enigo::new(&Settings::default())
+                            .map_err(|e| Error::Inject(format!("enigo init: {e}")))?;
+                        e.text(text)
+                            .map_err(|e| Error::Inject(format!("typing: {e}")))?;
+                        Ok("typed (clipboard held non-text content)".to_string())
+                    }
+                }
             }
         }
     }

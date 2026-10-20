@@ -55,27 +55,24 @@ impl Logger {
 
     /// Log a transcript only if explicitly enabled (privacy default is off).
     pub fn transcript(&self, msg: &str) {
-        if let Ok(inner) = self.inner.lock() {
-            if inner.log_transcripts {
-                drop(inner);
-                self.info(msg);
-            }
+        if crate::sync::lock_recover(&self.inner).log_transcripts {
+            self.info(msg);
         }
     }
 
     fn log(&self, level: Level, msg: &str) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if level > inner.level {
-                return;
-            }
-            let secs = inner.start.elapsed().as_secs_f64();
-            let line = format!("[{:>9.3}s] {:<5} {}", secs, level_name(level), msg);
-            eprintln!("{line}");
-            let _ = inner.rotate_if_needed();
-            if let Some(f) = inner.file.as_mut() {
-                let _ = writeln!(f, "{line}");
-                let _ = f.flush();
-            }
+        let mut inner = crate::sync::lock_recover(&self.inner);
+        if level > inner.level {
+            return;
+        }
+        let secs = inner.start.elapsed().as_secs_f64();
+        let line = format!("[{:>9.3}s] {:<5} {}", secs, level_name(level), sanitize(msg));
+        // Fallible write: a broken stderr pipe must not crash the daemon.
+        let _ = writeln!(std::io::stderr(), "{line}");
+        let _ = inner.rotate_if_needed();
+        if let Some(f) = inner.file.as_mut() {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
         }
     }
 }
@@ -90,6 +87,9 @@ impl Inner {
             let bak = self.path.with_extension("log.1");
             let _ = fs::remove_file(&bak);
             let _ = fs::rename(&self.path, &bak);
+            // Drop the open handle so the current log is recreated fresh below;
+            // otherwise new lines keep appending to the rotated file forever.
+            self.file = None;
         }
         if self.file.is_none() {
             if let Some(p) = self.path.parent() {
@@ -110,5 +110,108 @@ fn level_name(l: Level) -> &'static str {
         Level::Warn => "WARN",
         Level::Info => "INFO",
         Level::Debug => "DEBUG",
+    }
+}
+
+/// Escape control characters so a hostile/malformed input (a device name or a
+/// transcript) cannot forge log lines or inject terminal escape sequences.
+fn sanitize(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    for c in msg.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || (0x7f..=0x9f).contains(&(c as u32)) => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rotation_reopens_fresh_file() {
+        let dir = std::env::temp_dir().join("rapcoding-log-rot");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rapcoding.log");
+        fs::write(&path, vec![b'x'; (MAX_LOG_BYTES as usize) + 1]).unwrap();
+        let f = OpenOptions::new().append(true).open(&path).unwrap();
+        let mut inner = Inner {
+            file: Some(f),
+            path: path.clone(),
+            level: Level::Info,
+            start: Instant::now(),
+            log_transcripts: false,
+        };
+        inner.rotate_if_needed().unwrap();
+        assert!(path.exists(), "current log must be recreated after rotation");
+        assert!(
+            dir.join("rapcoding.log.1").exists(),
+            "old log must be rotated away"
+        );
+        if let Some(f) = inner.file.as_mut() {
+            let _ = writeln!(f, "AFTER_ROTATE");
+            let _ = f.flush();
+        }
+        let current = fs::read_to_string(&path).unwrap();
+        assert!(
+            current.contains("AFTER_ROTATE"),
+            "new lines must land in the current log, not the rotated one"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_recovers_from_poison() {
+        let dir = std::env::temp_dir().join("rapcoding-log-poison");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rapcoding.log");
+        let logger = Logger::new(path.clone(), Level::Info, false).unwrap();
+        let inner = logger.inner.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = inner.lock().unwrap();
+            panic!("poison");
+        }));
+        logger.info("after poison");
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        assert!(content.contains("after poison"), "log must recover from a poisoned mutex");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn log_sanitizes_control_chars() {
+        let dir = std::env::temp_dir().join("rapcoding-log-sanitize");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rapcoding.log");
+        let logger = Logger::new(path.clone(), Level::Info, false).unwrap();
+        logger.info("line1\nline2\x1b[31mRED\tend");
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(content.lines().count(), 1, "one log entry = one line (no raw newline)");
+        assert!(!content.contains('\x1b'), "no raw escape sequences");
+        assert!(content.contains("\\n"), "newline must be escaped");
+        assert!(content.contains("\\x1b"), "escape must be hex-escaped");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_not_logged_by_default() {
+        let dir = std::env::temp_dir().join("rapcoding-log-priv");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rapcoding.log");
+        let logger = Logger::new(path.clone(), Level::Info, false).unwrap();
+        logger.transcript("SECRET");
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        assert!(!content.contains("SECRET"), "transcripts must not be logged by default");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

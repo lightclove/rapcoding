@@ -31,7 +31,6 @@ pub struct General {
 #[serde(default, deny_unknown_fields)]
 pub struct Audio {
     pub device: String,
-    pub sample_rate: u32,
     pub silence_threshold: f32,
     pub silence_padding_ms: u32,
     pub min_speech_ms: u32,
@@ -90,7 +89,6 @@ impl Default for Audio {
     fn default() -> Self {
         Audio {
             device: String::new(),
-            sample_rate: 16_000,
             silence_threshold: 0.008,
             silence_padding_ms: 200,
             min_speech_ms: 250,
@@ -138,20 +136,31 @@ impl Config {
                 self.general.mode
             )));
         }
-        if self.general.max_record_secs == 0 {
-            return Err(Error::Config("general.max_record_secs must be > 0".into()));
+        if !(1..=3600).contains(&self.general.max_record_secs) {
+            return Err(Error::Config(
+                "general.max_record_secs must be in 1..=3600".into(),
+            ));
         }
         crate::hotkey::parse_hotkey(&self.general.hotkey)?;
         crate::hotkey::parse_hotkey(&self.general.en_hotkey)?;
-        if self.audio.sample_rate == 0 || self.audio.sample_rate > 384_000 {
-            return Err(Error::Config(format!(
-                "audio.sample_rate out of range: {}",
-                self.audio.sample_rate
-            )));
+        if self.general.hotkey == self.general.en_hotkey {
+            return Err(Error::Config(
+                "general.hotkey and general.en_hotkey must differ".into(),
+            ));
         }
         if !(0.0..1.0).contains(&self.audio.silence_threshold) {
             return Err(Error::Config(
                 "audio.silence_threshold must be in [0, 1)".into(),
+            ));
+        }
+        if self.audio.silence_padding_ms > 5_000 {
+            return Err(Error::Config(
+                "audio.silence_padding_ms must be <= 5000".into(),
+            ));
+        }
+        if self.audio.min_speech_ms > 60_000 {
+            return Err(Error::Config(
+                "audio.min_speech_ms must be <= 60000".into(),
             ));
         }
         if !matches!(
@@ -168,6 +177,9 @@ impl Config {
                 "inject.method must be 'paste' or 'type', got '{}'",
                 self.inject.method
             )));
+        }
+        if self.inject.settle_ms > 10_000 {
+            return Err(Error::Config("inject.settle_ms must be <= 10000".into()));
         }
         Ok(())
     }
@@ -289,6 +301,41 @@ mod tests {
     fn invalid_en_hotkey_rejected() {
         let mut c = Config::default();
         c.general.en_hotkey = "ctrl+space+alt".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn identical_hotkeys_rejected() {
+        let mut c = Config::default();
+        c.general.en_hotkey = c.general.hotkey.clone();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn silence_padding_ms_upper_bound() {
+        let mut c = Config::default();
+        c.audio.silence_padding_ms = 5001;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn min_speech_ms_upper_bound() {
+        let mut c = Config::default();
+        c.audio.min_speech_ms = 60_001;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn settle_ms_upper_bound() {
+        let mut c = Config::default();
+        c.inject.settle_ms = 10_001;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn max_record_secs_upper_bound() {
+        let mut c = Config::default();
+        c.general.max_record_secs = 3601;
         assert!(c.validate().is_err());
     }
 }

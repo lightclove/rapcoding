@@ -19,8 +19,8 @@ pub fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
     w.write_all(&16u32.to_le_bytes())?; // fmt chunk size
     w.write_all(&1u16.to_le_bytes())?; // PCM
     w.write_all(&1u16.to_le_bytes())?; // mono
-    w.write_all(&16000u32.to_le_bytes())?; // sample rate
-    w.write_all(&32000u32.to_le_bytes())?; // byte rate = rate * block_align
+    w.write_all(&crate::asr::ASR_RATE.to_le_bytes())?; // sample rate
+    w.write_all(&(crate::asr::ASR_RATE * 2).to_le_bytes())?; // byte rate = rate * block_align
     w.write_all(&2u16.to_le_bytes())?; // block align
     w.write_all(&16u16.to_le_bytes())?; // bits per sample
 
@@ -47,14 +47,22 @@ pub fn read_wav(path: &Path) -> Result<Vec<f32>> {
     let mut channels = 0usize;
     let mut rate = 0u32;
     let mut bits = 0u16;
+    let mut format = 0u16;
     let mut data: &[u8] = &[];
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let size = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if id == b"data" && pos + 8 + size > bytes.len() {
+            return Err(Error::Audio(format!(
+                "{}: truncated data chunk",
+                path.display()
+            )));
+        }
         let body = &bytes[pos + 8..(pos + 8 + size).min(bytes.len())];
         match id {
             b"fmt " => {
                 if body.len() >= 16 {
+                    format = u16::from_le_bytes(body[0..2].try_into().unwrap());
                     channels = u16::from_le_bytes(body[2..4].try_into().unwrap()) as usize;
                     rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
                     bits = u16::from_le_bytes(body[14..16].try_into().unwrap());
@@ -74,9 +82,21 @@ pub fn read_wav(path: &Path) -> Result<Vec<f32>> {
             path.display()
         )));
     }
+    if format != 1 {
+        return Err(Error::Audio(format!(
+            "{}: unsupported audio format {format} (need PCM)",
+            path.display()
+        )));
+    }
     if bits != 16 {
         return Err(Error::Audio(format!(
             "{}: unsupported bit depth {bits} (need 16)",
+            path.display()
+        )));
+    }
+    if channels > 32 {
+        return Err(Error::Audio(format!(
+            "{}: unsupported channel count {channels}",
             path.display()
         )));
     }
@@ -88,7 +108,7 @@ pub fn read_wav(path: &Path) -> Result<Vec<f32>> {
         }
         mono.push(sum / channels as f32);
     }
-    Ok(crate::audio::resample(&mono, rate, 16_000))
+    Ok(crate::audio::resample(&mono, rate, crate::asr::ASR_RATE))
 }
 
 #[cfg(test)]
@@ -138,5 +158,49 @@ mod tests {
         for (a, b) in samples.iter().zip(back.iter()) {
             assert!((a - b).abs() < 0.01, "{a} vs {b}");
         }
+    }
+
+    fn bytes_of(samples: &[f32]) -> Vec<u8> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!("rapc-wav-bytes-{}-{n}.wav", std::process::id()));
+        write_wav(&p, samples).unwrap();
+        let b = std::fs::read(&p).unwrap();
+        let _ = std::fs::remove_file(&p);
+        b
+    }
+
+    #[test]
+    fn rejects_non_pcm_format() {
+        let mut b = bytes_of(&[0.0f32; 100]);
+        b[20] = 2; // audio_format = Microsoft ADPCM (not PCM)
+        b[21] = 0;
+        let p = std::env::temp_dir().join("rapc-nonpcm.wav");
+        std::fs::write(&p, &b).unwrap();
+        assert!(read_wav(&p).is_err(), "non-PCM must be rejected");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rejects_truncated_data_chunk() {
+        let mut b = bytes_of(&[0.0f32; 100]);
+        let declared = (b.len() as u32 + 1000).to_le_bytes();
+        b[40..44].copy_from_slice(&declared);
+        let p = std::env::temp_dir().join("rapc-truncated.wav");
+        std::fs::write(&p, &b).unwrap();
+        assert!(read_wav(&p).is_err(), "truncated data chunk must be rejected");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn rejects_absurd_channels() {
+        let mut b = bytes_of(&[0.0f32; 100]);
+        b[22] = 200; // channels = 200 (low byte)
+        b[23] = 0;
+        let p = std::env::temp_dir().join("rapc-channels.wav");
+        std::fs::write(&p, &b).unwrap();
+        assert!(read_wav(&p).is_err(), "absurd channel count must be rejected");
+        let _ = std::fs::remove_file(&p);
     }
 }

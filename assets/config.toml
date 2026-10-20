@@ -10,7 +10,6 @@ log_transcripts = false    # privacy: keep recognized text out of the log
 
 [audio]
 device = ""                # empty = system default input; otherwise a case-insensitive substring
-sample_rate = 16000        # ASR target rate; downmix + resample are automatic
 silence_threshold = 0.008  # abs sample value below this is treated as silence (0.0..1.0)
 silence_padding_ms = 200   # silence kept around detected speech
 min_speech_ms = 250        # reject shorter utterances as noise

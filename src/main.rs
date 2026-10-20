@@ -5,6 +5,7 @@ mod error;
 mod hotkey;
 mod inject;
 mod log;
+mod sync;
 mod text;
 mod wav;
 
@@ -102,10 +103,10 @@ enum Lang {
 
 impl Lang {
     fn of(id: usize) -> Self {
-        if id == 0 {
-            Lang::Ru
-        } else {
-            Lang::En
+        match id {
+            0 => Lang::Ru,
+            1 => Lang::En,
+            other => unreachable!("unknown hotkey id {other}"),
         }
     }
 
@@ -259,8 +260,8 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
         while let Ok(r) = work_rx.try_recv() {
             if r.ok {
                 logger.info(&format!(
-                    "recognized {} chars; asr {:?}; inject {:?}",
-                    r.text_len, r.asr_ms, r.inject_ms
+                    "recognized {} chars; asr {:?}; inject {:?} ({})",
+                    r.text_len, r.asr_ms, r.inject_ms, r.message
                 ));
             } else {
                 logger.warn(&r.message);
@@ -296,17 +297,25 @@ fn spawn_worker(
     tx: Sender<WorkResult>,
 ) {
     std::thread::spawn(move || {
-        let result = process_utterance(
-            samples,
-            rate,
-            lang,
-            &cfg,
-            &asr,
-            &en,
-            &en_model_dir,
-            &injector,
-            &logger,
-        );
+        // Always deliver a result so `busy` is never left stuck by a panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_utterance(
+                samples,
+                rate,
+                lang,
+                &cfg,
+                &asr,
+                &en,
+                &en_model_dir,
+                &injector,
+                &logger,
+            )
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = panic_message(&payload);
+            logger.warn(&format!("worker {msg}"));
+            fail(msg)
+        });
         let _ = tx.send(result);
     });
 }
@@ -318,7 +327,7 @@ fn transcribe_en(
     dir: &Path,
     logger: &Logger,
 ) -> Result<String> {
-    let mut guard = en.lock().unwrap();
+    let mut guard = sync::lock_recover(en.as_ref());
     if guard.is_none() {
         logger.info("loading english model…");
         *guard = Some(asr::VoskAsr::new(dir)?);
@@ -337,7 +346,7 @@ fn process_utterance(
     injector: &inject::Injector,
     logger: &Logger,
 ) -> WorkResult {
-    let target = cfg.audio.sample_rate;
+    let target = asr::ASR_RATE;
     let mono = audio::resample(&samples, rate, target);
     let pad = (cfg.audio.silence_padding_ms as usize * target as usize) / 1000;
     let speech = audio::trim_silence(&mono, cfg.audio.silence_threshold, pad);
@@ -410,6 +419,17 @@ fn fail(message: String) -> WorkResult {
         asr_ms: Duration::ZERO,
         inject_ms: Duration::ZERO,
         message,
+    }
+}
+
+/// Extract a human-readable message from a panic payload.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        format!("panic: {s}")
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        format!("panic: {s}")
+    } else {
+        "panic (unknown payload)".to_string()
     }
 }
 
@@ -583,9 +603,10 @@ fn cmd_inject(override_path: Option<&Path>, text: &str) -> Result<i32> {
 }
 
 fn config_dir_of(path: &Path) -> PathBuf {
-    path.parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(config::config_dir)
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => config::config_dir(),
+    }
 }
 
 fn print_help() {
@@ -615,4 +636,21 @@ ENV:
   RAPCODING_CONFIG_DIR   Override the config directory
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lang_of_maps_hotkey_ids() {
+        assert!(matches!(Lang::of(0), Lang::Ru));
+        assert!(matches!(Lang::of(1), Lang::En));
+    }
+
+    #[test]
+    #[should_panic]
+    fn lang_of_rejects_unknown_id() {
+        let _ = Lang::of(2);
+    }
 }

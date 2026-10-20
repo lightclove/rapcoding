@@ -278,10 +278,20 @@ pub fn normalize_spacing(input: &str) -> String {
     while i < n {
         let c = chars[i];
         if c == ' ' || c == '\t' {
-            let prev = out.chars().rev().find(|&c| c != ' ');
-            let next = next_nonspace(&chars, i + 1);
-            if should_keep_space(prev, next) {
-                out.push(' ');
+            // A whitespace run containing a tab (inserted by a voice command)
+            // keeps the tab; otherwise collapse to a single space (or none).
+            let has_tab = chars[i..]
+                .iter()
+                .take_while(|&&x| x == ' ' || x == '\t')
+                .any(|&x| x == '\t');
+            if has_tab {
+                out.push('\t');
+            } else {
+                let prev = out.chars().rev().find(|&c| c != ' ');
+                let next = next_nonspace(&chars, i + 1);
+                if should_keep_space(prev, next) {
+                    out.push(' ');
+                }
             }
             while i < n && (chars[i] == ' ' || chars[i] == '\t') {
                 i += 1;
@@ -345,6 +355,12 @@ mod tests {
     fn aggressive_voice_commands() {
         let out = postprocess("слово запятая слово", "aggressive", true, false);
         assert_eq!(out, "слово, слово");
+    }
+
+    #[test]
+    fn tab_command_emits_tab() {
+        let out = postprocess("слово таб слово", "aggressive", true, false);
+        assert_eq!(out, "слово\tслово");
     }
 
     #[test]

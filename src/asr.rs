@@ -5,6 +5,10 @@ use vosk::{Model, Recognizer};
 
 use crate::error::{Error, Result};
 
+/// Target sample rate for the ASR backend. Vosk models are trained at 16 kHz,
+/// so audio is always resampled to this rate before recognition.
+pub const ASR_RATE: u32 = 16_000;
+
 /// Convert normalized f32 samples to 16-bit PCM (vosk input format).
 pub fn samples_to_i16(samples: &[f32]) -> Vec<i16> {
     samples
@@ -48,7 +52,7 @@ impl VoskAsr {
     /// Transcribe 16 kHz mono samples. Model stays loaded between calls.
     pub fn transcribe_samples(&self, samples_16k: &[f32]) -> Result<String> {
         let pcm = samples_to_i16(samples_16k);
-        let mut rec = Recognizer::new(&self.model, 16000.0)
+        let mut rec = Recognizer::new(&self.model, ASR_RATE as f32)
             .ok_or_else(|| Error::Asr("failed to create vosk recognizer".into()))?;
         rec.accept_waveform(&pcm)
             .map_err(|e| Error::Asr(format!("vosk accept_waveform: {e}")))?;
