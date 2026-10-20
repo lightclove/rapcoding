@@ -11,7 +11,7 @@ mod wav;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use error::{Error, Result};
@@ -93,6 +93,30 @@ enum Mode {
     Toggle,
 }
 
+/// Which hotkey/model an utterance belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum Lang {
+    Ru,
+    En,
+}
+
+impl Lang {
+    fn of(id: usize) -> Self {
+        if id == 0 {
+            Lang::Ru
+        } else {
+            Lang::En
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Lang::Ru => "ru",
+            Lang::En => "en",
+        }
+    }
+}
+
 fn parse_mode(s: &str) -> Result<Mode> {
     match s {
         "hold" => Ok(Mode::Hold),
@@ -133,11 +157,15 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
 
     let base_dir = config_dir_of(&path);
     let model_dir = config::resolve_model_path(&base_dir, &cfg.asr.model);
+    let en_model_dir = config::resolve_model_path(&base_dir, &cfg.asr.en_model);
     let asr = asr::VoskAsr::new(&model_dir)?;
     if let Err(e) = asr.check() {
         logger.warn(&format!("asr not ready: {e} (recognition will fail)"));
     }
-    logger.debug(&format!("asr: model={}", cfg.asr.model));
+    logger.debug(&format!(
+        "asr: model={} en_model={}",
+        cfg.asr.model, cfg.asr.en_model
+    ));
     let injector = inject::Injector::new(
         cfg.inject.enabled,
         &cfg.inject.method,
@@ -147,28 +175,36 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
     )?;
 
     let (hot_tx, hot_rx) = mpsc::channel::<hotkey::HotMsg>();
-    let _hk = hotkey::spawn_hotkey(&cfg.general.hotkey, hot_tx)?;
-    logger.info(&format!(
-        "hotkey '{}' registered (mode {})",
-        cfg.general.hotkey, cfg.general.mode
-    ));
+    let bindings = vec![cfg.general.hotkey.clone(), cfg.general.en_hotkey.clone()];
+    let _hk = hotkey::spawn_hotkeys(&bindings, hot_tx)?;
+    for b in &bindings {
+        logger.info(&format!(
+            "hotkey '{b}' registered (mode {})",
+            cfg.general.mode
+        ));
+    }
 
     let (work_tx, work_rx) = mpsc::channel::<WorkResult>();
     let busy = Arc::new(AtomicBool::new(false));
+    // English model loads lazily on first EN utterance to save RAM.
+    let en = Arc::new(Mutex::new(None::<asr::VoskAsr>));
     let max = Duration::from_secs(cfg.general.max_record_secs.max(1));
-    let mut recording = false;
+    let mut recording: Option<usize> = None;
 
-    let dispatch = |samples: Vec<f32>| {
+    let dispatch = |samples: Vec<f32>, lang: Lang| {
         if samples.is_empty() {
             return;
         }
         busy.store(true, Ordering::Relaxed);
-        logger.info("transcribing…");
+        logger.info(&format!("transcribing… ({})", lang.name()));
         spawn_worker(
             samples,
             audio.device_rate(),
+            lang,
             cfg.clone(),
             asr.clone(),
+            en.clone(),
+            en_model_dir.clone(),
             injector.clone(),
             logger.clone(),
             work_tx.clone(),
@@ -184,32 +220,31 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
                     fatal = Some(e);
                     break;
                 }
-                hotkey::HotMsg::Event(ev) => match (mode, ev) {
+                hotkey::HotMsg::Event { id, state } => match (mode, state) {
                     (Mode::Hold, hotkey::HotEvent::Pressed) => {
                         if busy.load(Ordering::Relaxed) {
                             logger.warn("busy: ignoring hotkey");
-                        } else if !recording {
+                        } else if recording.is_none() {
                             audio.start();
-                            recording = true;
-                            logger.info("listening");
+                            recording = Some(id);
+                            logger.info(&format!("listening ({})", Lang::of(id).name()));
                         }
                     }
                     (Mode::Hold, hotkey::HotEvent::Released) => {
-                        if recording {
-                            recording = false;
-                            dispatch(audio.stop());
+                        if recording == Some(id) {
+                            recording = None;
+                            dispatch(audio.stop(), Lang::of(id));
                         }
                     }
                     (Mode::Toggle, hotkey::HotEvent::Pressed) => {
-                        if recording {
-                            recording = false;
-                            dispatch(audio.stop());
+                        if let Some(start_id) = recording.take() {
+                            dispatch(audio.stop(), Lang::of(start_id));
                         } else if busy.load(Ordering::Relaxed) {
                             logger.warn("busy: ignoring hotkey");
                         } else {
                             audio.start();
-                            recording = true;
-                            logger.info("listening");
+                            recording = Some(id);
+                            logger.info(&format!("listening ({})", Lang::of(id).name()));
                         }
                     }
                     (_, hotkey::HotEvent::Released) => {}
@@ -234,12 +269,12 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
         }
 
         // Auto-stop runaway recordings.
-        if recording {
+        if recording.is_some() {
             if let Some(el) = audio.elapsed() {
                 if el >= max {
-                    recording = false;
+                    let start_id = recording.take().unwrap();
                     logger.info("auto-stop at max duration");
-                    dispatch(audio.stop());
+                    dispatch(audio.stop(), Lang::of(start_id));
                 }
             }
         }
@@ -251,23 +286,54 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
 fn spawn_worker(
     samples: Vec<f32>,
     rate: u32,
+    lang: Lang,
     cfg: config::Config,
     asr: asr::VoskAsr,
+    en: Arc<Mutex<Option<asr::VoskAsr>>>,
+    en_model_dir: PathBuf,
     injector: inject::Injector,
     logger: Logger,
     tx: Sender<WorkResult>,
 ) {
     std::thread::spawn(move || {
-        let result = process_utterance(samples, rate, &cfg, &asr, &injector, &logger);
+        let result = process_utterance(
+            samples,
+            rate,
+            lang,
+            &cfg,
+            &asr,
+            &en,
+            &en_model_dir,
+            &injector,
+            &logger,
+        );
         let _ = tx.send(result);
     });
+}
+
+/// Transcribe with the English model, loading it on first use.
+fn transcribe_en(
+    speech: &[f32],
+    en: &Arc<Mutex<Option<asr::VoskAsr>>>,
+    dir: &Path,
+    logger: &Logger,
+) -> Result<String> {
+    let mut guard = en.lock().unwrap();
+    if guard.is_none() {
+        logger.info("loading english model…");
+        *guard = Some(asr::VoskAsr::new(dir)?);
+    }
+    guard.as_ref().unwrap().transcribe_samples(speech)
 }
 
 fn process_utterance(
     samples: Vec<f32>,
     rate: u32,
+    lang: Lang,
     cfg: &config::Config,
     asr: &asr::VoskAsr,
+    en: &Arc<Mutex<Option<asr::VoskAsr>>>,
+    en_model_dir: &Path,
     injector: &inject::Injector,
     logger: &Logger,
 ) -> WorkResult {
@@ -295,7 +361,11 @@ fn process_utterance(
     ));
 
     let t0 = Instant::now();
-    let raw = match asr.transcribe_samples(&speech) {
+    let raw = match lang {
+        Lang::Ru => asr.transcribe_samples(&speech),
+        Lang::En => transcribe_en(&speech, en, en_model_dir, logger),
+    };
+    let raw = match raw {
         Ok(s) => s,
         Err(e) => {
             return fail(format!("asr: {e}"));
@@ -364,6 +434,13 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
             ok = false;
         }
     }
+    match hotkey::parse_hotkey(&cfg.general.en_hotkey) {
+        Ok(_) => println!("  ok: general.en_hotkey = {}", cfg.general.en_hotkey),
+        Err(e) => {
+            println!("  FAIL: {e}");
+            ok = false;
+        }
+    }
     if cfg.inject.paste_shortcut.is_empty() {
         println!("  ok: inject.paste_shortcut = platform default");
     } else {
@@ -395,6 +472,20 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
     match asr::VoskAsr::new(&config::resolve_model_path(&base_dir, &cfg.asr.model)) {
         Ok(a) => match a.check() {
             Ok(()) => println!("  ok: asr model '{}' present", cfg.asr.model),
+            Err(e) => {
+                println!("  FAIL: {e}");
+                ok = false;
+            }
+        },
+        Err(e) => {
+            println!("  FAIL: {e}");
+            ok = false;
+        }
+    }
+
+    match asr::VoskAsr::new(&config::resolve_model_path(&base_dir, &cfg.asr.en_model)) {
+        Ok(a) => match a.check() {
+            Ok(()) => println!("  ok: asr en_model '{}' present", cfg.asr.en_model),
             Err(e) => {
                 println!("  FAIL: {e}");
                 ok = false;

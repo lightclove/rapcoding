@@ -22,6 +22,7 @@ pub struct Config {
 pub struct General {
     pub mode: String,
     pub hotkey: String,
+    pub en_hotkey: String,
     pub max_record_secs: u64,
     pub log_transcripts: bool,
 }
@@ -40,6 +41,7 @@ pub struct Audio {
 #[serde(default, deny_unknown_fields)]
 pub struct Asr {
     pub model: String,
+    pub en_model: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,6 +79,7 @@ impl Default for General {
         General {
             mode: "hold".into(),
             hotkey: "ctrl+alt+space".into(),
+            en_hotkey: "ctrl+win+alt+space".into(),
             max_record_secs: 120,
             log_transcripts: false,
         }
@@ -99,6 +102,7 @@ impl Default for Asr {
     fn default() -> Self {
         Asr {
             model: "models/vosk-model-small-ru-0.22".into(),
+            en_model: "models/vosk-model-small-en-us-0.15".into(),
         }
     }
 }
@@ -137,6 +141,8 @@ impl Config {
         if self.general.max_record_secs == 0 {
             return Err(Error::Config("general.max_record_secs must be > 0".into()));
         }
+        crate::hotkey::parse_hotkey(&self.general.hotkey)?;
+        crate::hotkey::parse_hotkey(&self.general.en_hotkey)?;
         if self.audio.sample_rate == 0 || self.audio.sample_rate > 384_000 {
             return Err(Error::Config(format!(
                 "audio.sample_rate out of range: {}",
@@ -277,5 +283,12 @@ mod tests {
         Config::default()
             .validate()
             .expect("defaults must be valid");
+    }
+
+    #[test]
+    fn invalid_en_hotkey_rejected() {
+        let mut c = Config::default();
+        c.general.en_hotkey = "ctrl+space+alt".into();
+        assert!(c.validate().is_err());
     }
 }
