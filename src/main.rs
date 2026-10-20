@@ -9,6 +9,7 @@ mod sync;
 mod text;
 mod wav;
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -25,7 +26,13 @@ fn main() {
     let code = match run(args) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("rapcoding error: {e}");
+            // Fallible + sanitized: never panic while reporting, and never let
+            // a control char in an error message forge/color the terminal.
+            let _ = writeln!(
+                std::io::stderr(),
+                "rapcoding error: {}",
+                log::sanitize(&e.to_string())
+            );
             1
         }
     };
@@ -270,10 +277,10 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
         }
 
         // Auto-stop runaway recordings.
-        if recording.is_some() {
+        if let Some(start_id) = recording {
             if let Some(el) = audio.elapsed() {
                 if el >= max {
-                    let start_id = recording.take().unwrap();
+                    recording = None;
                     logger.info("auto-stop at max duration");
                     dispatch(audio.stop(), Lang::of(start_id));
                 }
@@ -332,7 +339,10 @@ fn transcribe_en(
         logger.info("loading english model…");
         *guard = Some(asr::VoskAsr::new(dir)?);
     }
-    guard.as_ref().unwrap().transcribe_samples(speech)
+    let Some(asr) = guard.as_ref() else {
+        return Err(Error::Asr("english model unavailable".into()));
+    };
+    asr.transcribe_samples(speech)
 }
 
 fn process_utterance(

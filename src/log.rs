@@ -55,7 +55,13 @@ impl Logger {
 
     /// Log a transcript only if explicitly enabled (privacy default is off).
     pub fn transcript(&self, msg: &str) {
-        if crate::sync::lock_recover(&self.inner).log_transcripts {
+        // Scope the guard explicitly: `self.info` re-acquires the same mutex,
+        // and a guard held across that call would deadlock.
+        let enabled = {
+            let inner = crate::sync::lock_recover(&self.inner);
+            inner.log_transcripts
+        };
+        if enabled {
             self.info(msg);
         }
     }
@@ -115,7 +121,7 @@ fn level_name(l: Level) -> &'static str {
 
 /// Escape control characters so a hostile/malformed input (a device name or a
 /// transcript) cannot forge log lines or inject terminal escape sequences.
-fn sanitize(msg: &str) -> String {
+pub(crate) fn sanitize(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     for c in msg.chars() {
         match c {
@@ -203,6 +209,14 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_escapes_control_chars() {
+        assert_eq!(sanitize("a\nb"), "a\\nb");
+        assert_eq!(sanitize("x\t\r"), "x\\t\\r");
+        assert_eq!(sanitize("a\x1b[31m"), "a\\x1b[31m");
+        assert_eq!(sanitize("plain"), "plain");
+    }
+
+    #[test]
     fn transcript_not_logged_by_default() {
         let dir = std::env::temp_dir().join("rapcoding-log-priv");
         let _ = fs::remove_dir_all(&dir);
@@ -212,6 +226,19 @@ mod tests {
         logger.transcript("SECRET");
         let content = fs::read_to_string(&path).unwrap_or_default();
         assert!(!content.contains("SECRET"), "transcripts must not be logged by default");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_logged_when_enabled() {
+        let dir = std::env::temp_dir().join("rapcoding-log-priv2");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rapcoding.log");
+        let logger = Logger::new(path.clone(), Level::Info, true).unwrap();
+        logger.transcript("HELLO");
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        assert!(content.contains("HELLO"), "transcripts must be logged when enabled");
         let _ = fs::remove_dir_all(&dir);
     }
 }

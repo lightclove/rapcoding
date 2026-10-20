@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -142,7 +143,14 @@ where
 {
     let s = shared.clone();
     let ch = channels as usize;
-    let err = |e: cpal::Error| eprintln!("audio stream error: {e}");
+    let err = |e: cpal::Error| {
+        // Fallible write: a broken stderr pipe must not panic the audio thread.
+        let _ = writeln!(
+            std::io::stderr(),
+            "audio stream error: {}",
+            crate::log::sanitize(&e.to_string())
+        );
+    };
     let cb = move |data: &[T], _info: &cpal::InputCallbackInfo| {
         if !s.recording.load(Ordering::Relaxed) {
             return;

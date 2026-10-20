@@ -167,41 +167,52 @@ pub fn default_chord() -> PasteChord {
 }
 
 fn send_chord(e: &mut Enigo, c: PasteChord) -> Result<()> {
-    if c.ctrl {
-        e.key(Key::Control, Direction::Press)
+    let mut ctrl_down = false;
+    let mut meta_down = false;
+    let mut alt_down = false;
+    let mut shift_down = false;
+
+    let result = (|| -> Result<()> {
+        if c.ctrl {
+            e.key(Key::Control, Direction::Press)
+                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            ctrl_down = true;
+        }
+        if c.meta {
+            e.key(Key::Meta, Direction::Press)
+                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            meta_down = true;
+        }
+        if c.alt {
+            e.key(Key::Alt, Direction::Press)
+                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            alt_down = true;
+        }
+        if c.shift {
+            e.key(Key::Shift, Direction::Press)
+                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            shift_down = true;
+        }
+        e.key(Key::Unicode(c.key), Direction::Click)
             .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+        Ok(())
+    })();
+
+    // Always release whatever was pressed, in reverse order, even on error —
+    // a transient failure must not leave the user with stuck modifier keys.
+    if shift_down {
+        let _ = e.key(Key::Shift, Direction::Release);
     }
-    if c.meta {
-        e.key(Key::Meta, Direction::Press)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+    if alt_down {
+        let _ = e.key(Key::Alt, Direction::Release);
     }
-    if c.alt {
-        e.key(Key::Alt, Direction::Press)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+    if meta_down {
+        let _ = e.key(Key::Meta, Direction::Release);
     }
-    if c.shift {
-        e.key(Key::Shift, Direction::Press)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+    if ctrl_down {
+        let _ = e.key(Key::Control, Direction::Release);
     }
-    e.key(Key::Unicode(c.key), Direction::Click)
-        .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
-    if c.shift {
-        e.key(Key::Shift, Direction::Release)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
-    }
-    if c.alt {
-        e.key(Key::Alt, Direction::Release)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
-    }
-    if c.meta {
-        e.key(Key::Meta, Direction::Release)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
-    }
-    if c.ctrl {
-        e.key(Key::Control, Direction::Release)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
-    }
-    Ok(())
+    result
 }
 
 #[cfg(test)]
