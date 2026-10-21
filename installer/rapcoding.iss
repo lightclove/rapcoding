@@ -44,10 +44,10 @@ Name: "custom"; Description: "Выборочная установка"; Flags: i
 Name: "app_gui"; Description: "Графический интерфейс (~4.5 МБ, включает консольный режим)"; Types: gui full custom; Flags: exclusive
 Name: "app_console"; Description: "Только консоль (~750 КБ, без окна)"; Types: console custom; Flags: exclusive
 ; Models (light or heavy, per language).
-Name: "ru_light"; Description: "Русская — лёгкая (~44 МБ)"; Types: gui console custom; Check: not WizardIsComponentSelected('ru_heavy')
-Name: "ru_heavy"; Description: "Русская — тяжёлая (~1.8 ГБ, точнее)"; Types: full custom; Check: not WizardIsComponentSelected('ru_light')
-Name: "en_light"; Description: "Английская — лёгкая (~39 МБ)"; Types: gui console custom; Check: not WizardIsComponentSelected('en_heavy')
-Name: "en_heavy"; Description: "Английская — тяжёлая (~1.8 ГБ, точнее)"; Types: full custom; Check: not WizardIsComponentSelected('en_light')
+Name: "ru_light"; Description: "Русская — лёгкая (~44 МБ)"; Types: gui console custom; Check: NotSelected('ru_heavy')
+Name: "ru_heavy"; Description: "Русская — тяжёлая (~1.8 ГБ, точнее)"; Types: full custom; Check: NotSelected('ru_light')
+Name: "en_light"; Description: "Английская — лёгкая (~39 МБ)"; Types: gui console custom; Check: NotSelected('en_heavy')
+Name: "en_heavy"; Description: "Английская — тяжёлая (~1.8 ГБ, точнее)"; Types: full custom; Check: NotSelected('en_light')
 
 [Tasks]
 Name: "startmenu"; Description: "Создать ярлык в меню «Пуск»"; GroupDescription: "Ярлыки:"
@@ -77,6 +77,13 @@ Filename: "powershell.exe"; \
     Tasks: taskbar; Flags: runhidden
 
 [Code]
+function NotSelected(const AName: String): Boolean;
+begin
+  // Silent mode has no wizard; skip mutual exclusion there (the caller
+  // selects components explicitly via /COMPONENTS).
+  Result := WizardSilent or (not WizardIsComponentSelected(AName));
+end;
+
 function AnyModelSelected: Boolean;
 begin
   Result := IsComponentSelected('ru_light') or IsComponentSelected('ru_heavy')
