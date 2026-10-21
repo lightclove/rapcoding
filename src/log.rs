@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -161,6 +161,7 @@ pub struct LiveLog {
 }
 
 impl LiveLog {
+    #[cfg(feature = "gui")]
     pub fn new(cap: usize) -> Self {
         LiveLog {
             inner: Arc::new(Mutex::new(VecDeque::new())),
@@ -178,13 +179,15 @@ impl LiveLog {
     }
 
     /// Oldest-first snapshot of the buffered lines.
+    #[cfg(feature = "gui")]
     pub fn snapshot(&self) -> Vec<String> {
         crate::sync::lock_recover(&self.inner).iter().cloned().collect()
     }
 }
 
 /// Copy the current log file to a user-chosen destination (GUI "export").
-pub fn export_log(src: &Path, dst: &Path) -> Result<()> {
+#[cfg(feature = "gui")]
+pub fn export_log(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     std::fs::copy(src, dst)?;
     Ok(())
 }
@@ -320,6 +323,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn live_log_caps_at_limit() {
         let live = LiveLog::new(3);
@@ -333,6 +337,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn live_log_keeps_order() {
         let live = LiveLog::new(10);
@@ -341,6 +346,7 @@ mod tests {
         assert_eq!(live.snapshot(), vec!["a".to_string(), "b".to_string()]);
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn logger_feeds_live_log() {
         let dir = std::env::temp_dir().join("rapcoding-log-live");
@@ -356,6 +362,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn export_log_copies_content() {
         let dir = std::env::temp_dir().join("rapcoding-log-export");

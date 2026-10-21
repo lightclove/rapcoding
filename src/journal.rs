@@ -40,6 +40,7 @@ impl Journal {
     }
 
     /// Newest-last list of entries (empty when the journal is absent).
+    #[cfg(feature = "gui")]
     pub fn read(&self) -> Vec<String> {
         fs::read_to_string(&self.path)
             .map(|s| s.lines().map(str::to_string).collect())
@@ -63,6 +64,7 @@ mod tests {
         dir
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn append_and_read_roundtrip() {
         let dir = tmp("journal-roundtrip");
@@ -76,6 +78,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn append_sanitizes_newlines() {
         let dir = tmp("journal-sanitize");
@@ -86,6 +89,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn read_missing_journal_is_empty() {
         let dir = tmp("journal-missing");

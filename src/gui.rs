@@ -1,7 +1,8 @@
 //! Native GUI (egui/eframe): settings/status window with light/dark themes.
 //! Compiled only with `--features gui`. The recognition daemon runs on a
 //! background thread and reports live status through the shared `Status`;
-//! log lines stream through `LiveLog` and management events land in `Journal`.
+//! log lines stream through `LiveLog`, management events land in `Journal`,
+//! and heavier models are downloaded/extracted in `download`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use eframe::egui;
 
 use crate::config::{self, Config};
+use crate::download;
 use crate::error::Result;
 use crate::journal::Journal;
 use crate::log::{self, LiveLog};
@@ -55,12 +57,23 @@ impl Theme {
     }
 }
 
+/// State of the current (or last) model download, shared with the download thread.
+#[derive(Clone)]
+enum DlState {
+    Idle,
+    Downloading { name: String, received: u64, total: u64 },
+    Extracting { name: String },
+    Done { name: String },
+    Error(String),
+}
+
 struct GuiApp {
     cfg: Config,
     config_path: PathBuf,
     status: Arc<Mutex<Status>>,
     live: LiveLog,
     journal: Journal,
+    dl_state: Arc<Mutex<DlState>>,
     theme: Theme,
     applied: Theme,
     persist_error: Option<String>,
@@ -78,7 +91,7 @@ pub fn run(
     let theme = Theme::from_config(&cfg.gui.theme);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 560.0])
+            .with_inner_size([760.0, 620.0])
             .with_min_inner_size([520.0, 360.0])
             .with_title("rapcoding"),
         ..Default::default()
@@ -89,6 +102,7 @@ pub fn run(
         status,
         live,
         journal,
+        dl_state: Arc::new(Mutex::new(DlState::Idle)),
         theme,
         applied: theme,
         persist_error: None,
@@ -127,7 +141,8 @@ impl eframe::App for GuiApp {
                     if ui.button(btn).clicked() {
                         self.theme = self.theme.toggle();
                         self.cfg.gui.theme = self.theme.as_str().to_string();
-                        self.journal.append("config", &format!("theme -> {}", self.theme.as_str()));
+                        self.journal
+                            .append("config", &format!("theme -> {}", self.theme.as_str()));
                         self.persist_error = match config::save(&self.config_path, &self.cfg) {
                             Ok(()) => None,
                             Err(e) => Some(e.to_string()),
@@ -148,15 +163,11 @@ impl eframe::App for GuiApp {
                 ui.add_space(8.0);
                 self.settings_section(ui);
                 ui.add_space(8.0);
+                self.models_section(ui);
+                ui.add_space(8.0);
                 self.log_section(ui);
                 ui.add_space(8.0);
                 self.journal_section(ui);
-                ui.add_space(8.0);
-                egui::CollapsingHeader::new("Модели")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.label("Загрузчик тяжёлых моделей появится в шаге B-11.");
-                    });
             });
         });
     }
@@ -209,6 +220,116 @@ impl GuiApp {
                 ui.monospace(&self.cfg.asr.en_model);
                 ui.end_row();
             });
+    }
+
+    fn models_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Модели")
+            .default_open(true)
+            .show(ui, |ui| {
+                let root = config::config_dir().join("models");
+                let state = sync::lock_recover(&self.dl_state).clone();
+                let busy = !matches!(
+                    state,
+                    DlState::Idle | DlState::Done { .. } | DlState::Error(_)
+                );
+
+                for m in download::MODELS {
+                    let installed = download::model_dir(&root, m.name).exists();
+                    ui.horizontal(|ui| {
+                        ui.label(format!(
+                            "{} ({} · {})",
+                            m.name,
+                            m.lang,
+                            download::human_size(m.size_bytes)
+                        ));
+                        if installed {
+                            ui.label("✓ установлена");
+                        } else if ui
+                            .add_enabled(!busy, egui::Button::new("Скачать"))
+                            .clicked()
+                        {
+                            self.start_download(m);
+                        }
+                    });
+                }
+
+                ui.separator();
+                match &state {
+                    DlState::Idle => {}
+                    DlState::Downloading {
+                        name,
+                        received,
+                        total,
+                    } => {
+                        let frac = if *total > 0 {
+                            (*received as f32 / *total as f32).clamp(0.0, 1.0)
+                        } else {
+                            0.0
+                        };
+                        ui.label(format!("Скачиваю {name}…"));
+                        ui.add(egui::ProgressBar::new(frac).show_percentage());
+                        ui.label(format!(
+                            "{} / {}",
+                            download::human_size(*received),
+                            download::human_size(*total)
+                        ));
+                    }
+                    DlState::Extracting { name } => {
+                        ui.horizontal(|ui| {
+                            ui.add(egui::Spinner::new());
+                            ui.label(format!("Распаковываю {name}…"));
+                        });
+                    }
+                    DlState::Done { name } => {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0x2e, 0xcc, 0x71),
+                            format!("{name} установлена (перезапустите rapcoding)"),
+                        );
+                    }
+                    DlState::Error(e) => {
+                        ui.colored_label(egui::Color32::from_rgb(0xe0, 0x50, 0x50), format!("Ошибка: {e}"));
+                    }
+                }
+            });
+    }
+
+    fn start_download(&self, m: &'static download::Model) {
+        let state = self.dl_state.clone();
+        let root = config::config_dir().join("models");
+        let name = m.name.to_string();
+        let url = m.url;
+        let size = m.size_bytes;
+        self.journal.append("download", &format!("start {name}"));
+        std::thread::spawn(move || {
+            let set = |s: DlState| {
+                *sync::lock_recover(&state) = s;
+            };
+            set(DlState::Downloading {
+                name: name.clone(),
+                received: 0,
+                total: size,
+            });
+            let zip_tmp = root.join(format!("{name}.zip.part"));
+            let dl = download::download(url, &zip_tmp, &mut |done, total| {
+                set(DlState::Downloading {
+                    name: name.clone(),
+                    received: done,
+                    total,
+                });
+            });
+            let result = match dl {
+                Ok(()) => {
+                    set(DlState::Extracting { name: name.clone() });
+                    download::extract_zip(&zip_tmp, &root)
+                }
+                Err(e) => Err(e),
+            };
+            let _ = std::fs::remove_file(&zip_tmp);
+            match result {
+                Ok(()) => set(DlState::Done { name }),
+                Err(e) => set(DlState::Error(e.to_string())),
+            }
+        });
     }
 
     fn log_section(&mut self, ui: &mut egui::Ui) {

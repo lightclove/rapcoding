@@ -10,6 +10,7 @@ pub enum Status {
 }
 
 impl Status {
+    #[cfg(feature = "gui")]
     pub fn label(&self) -> String {
         match self {
             Status::Idle => "Готов".into(),
@@ -24,21 +25,25 @@ impl Status {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "gui")]
     #[test]
     fn idle_label() {
         assert_eq!(Status::Idle.label(), "Готов");
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn listening_label() {
         assert_eq!(Status::Listening("ru").label(), "Слушаю (ru)");
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn transcribing_label() {
         assert_eq!(Status::Transcribing("en").label(), "Распознаю (en)");
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn error_label() {
         assert_eq!(Status::Error("boom".into()).label(), "Ошибка: boom");

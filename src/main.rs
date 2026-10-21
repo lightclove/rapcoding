@@ -1,6 +1,8 @@
 mod asr;
 mod audio;
 mod config;
+#[cfg(feature = "gui")]
+mod download;
 mod error;
 #[cfg(feature = "gui")]
 mod gui;

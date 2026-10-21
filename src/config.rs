@@ -278,6 +278,7 @@ pub fn load(path: &Path) -> Result<Config> {
 }
 
 /// Serialize a config back to TOML (used by the GUI to persist edits).
+#[cfg(feature = "gui")]
 pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     let s = toml::to_string_pretty(cfg)?;
     std::fs::write(path, s)?;
@@ -415,6 +416,7 @@ mod tests {
         assert_eq!(Config::default().gui.theme, "light");
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn save_load_roundtrip() {
         let cfg = Config::default();

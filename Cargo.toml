@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = []
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:eframe", "dep:rfd", "dep:ureq", "dep:zip"]
 
 [dependencies]
 arboard = { version = "3.7", default-features = false }
@@ -22,7 +22,9 @@ serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 toml = "0.8"
+ureq = { version = "2", optional = true }
 vosk = "0.3"
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
 [build-dependencies]
 winres = "0.1"

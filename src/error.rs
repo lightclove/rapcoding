@@ -24,8 +24,13 @@ pub enum Error {
     #[error("inject: {0}")]
     Inject(String),
 
+    #[cfg(feature = "gui")]
     #[error("gui: {0}")]
     Gui(String),
+
+    #[cfg(feature = "gui")]
+    #[error("download: {0}")]
+    Download(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
