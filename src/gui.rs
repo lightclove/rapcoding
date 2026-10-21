@@ -1,6 +1,7 @@
 //! Native GUI (egui/eframe): settings/status window with light/dark themes.
 //! Compiled only with `--features gui`. The recognition daemon runs on a
-//! background thread and reports live status through the shared `Status`.
+//! background thread and reports live status through the shared `Status`;
+//! log lines stream through `LiveLog` and management events land in `Journal`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -9,6 +10,8 @@ use eframe::egui;
 
 use crate::config::{self, Config};
 use crate::error::Result;
+use crate::journal::Journal;
+use crate::log::{self, LiveLog};
 use crate::status::Status;
 use crate::sync;
 
@@ -56,21 +59,26 @@ struct GuiApp {
     cfg: Config,
     config_path: PathBuf,
     status: Arc<Mutex<Status>>,
+    live: LiveLog,
+    journal: Journal,
     theme: Theme,
     applied: Theme,
     persist_error: Option<String>,
+    export_error: Option<String>,
 }
 
 pub fn run(
     cfg: Config,
     config_path: PathBuf,
     status: Arc<Mutex<Status>>,
+    live: LiveLog,
+    journal: Journal,
     _verbose: bool,
 ) -> Result<i32> {
     let theme = Theme::from_config(&cfg.gui.theme);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 540.0])
+            .with_inner_size([760.0, 560.0])
             .with_min_inner_size([520.0, 360.0])
             .with_title("rapcoding"),
         ..Default::default()
@@ -79,9 +87,12 @@ pub fn run(
         cfg,
         config_path,
         status,
+        live,
+        journal,
         theme,
         applied: theme,
         persist_error: None,
+        export_error: None,
     };
     eframe::run_native(
         "rapcoding",
@@ -116,6 +127,7 @@ impl eframe::App for GuiApp {
                     if ui.button(btn).clicked() {
                         self.theme = self.theme.toggle();
                         self.cfg.gui.theme = self.theme.as_str().to_string();
+                        self.journal.append("config", &format!("theme -> {}", self.theme.as_str()));
                         self.persist_error = match config::save(&self.config_path, &self.cfg) {
                             Ok(()) => None,
                             Err(e) => Some(e.to_string()),
@@ -136,20 +148,14 @@ impl eframe::App for GuiApp {
                 ui.add_space(8.0);
                 self.settings_section(ui);
                 ui.add_space(8.0);
-                egui::CollapsingHeader::new("Лог")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.label("Живой лог появится в шаге B-09.");
-                    });
+                self.log_section(ui);
+                ui.add_space(8.0);
+                self.journal_section(ui);
+                ui.add_space(8.0);
                 egui::CollapsingHeader::new("Модели")
                     .default_open(true)
                     .show(ui, |ui| {
                         ui.label("Загрузчик тяжёлых моделей появится в шаге B-11.");
-                    });
-                egui::CollapsingHeader::new("Журнал")
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        ui.label("Журнал управления появится в шаге B-10.");
                     });
             });
         });
@@ -202,6 +208,61 @@ impl GuiApp {
                 ui.label("Модель EN");
                 ui.monospace(&self.cfg.asr.en_model);
                 ui.end_row();
+            });
+    }
+
+    fn log_section(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Лог")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Экспорт…").clicked() {
+                        if let Some(dst) = rfd::FileDialog::new()
+                            .set_file_name("rapcoding.log")
+                            .save_file()
+                        {
+                            let src = config::config_dir().join("rapcoding.log");
+                            self.journal
+                                .append("log", &format!("export -> {}", dst.display()));
+                            self.export_error = match log::export_log(&src, &dst) {
+                                Ok(()) => None,
+                                Err(e) => Some(e.to_string()),
+                            };
+                        }
+                    }
+                    if let Some(err) = &self.export_error {
+                        ui.colored_label(egui::Color32::from_rgb(0xe0, 0x50, 0x50), err);
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(240.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in self.live.snapshot() {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+    }
+
+    fn journal_section(&self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Журнал")
+            .default_open(true)
+            .show(ui, |ui| {
+                let entries = self.journal.read();
+                if entries.is_empty() {
+                    ui.label("Пока пусто.");
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(160.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in entries {
+                                ui.monospace(line);
+                            }
+                        });
+                }
             });
     }
 }

@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -26,16 +27,23 @@ struct Inner {
     level: Level,
     start: Instant,
     log_transcripts: bool,
+    live: Option<LiveLog>,
 }
 
 impl Logger {
-    pub fn new(path: PathBuf, level: Level, log_transcripts: bool) -> Result<Self> {
+    pub fn new_with_live(
+        path: PathBuf,
+        level: Level,
+        log_transcripts: bool,
+        live: Option<LiveLog>,
+    ) -> Result<Self> {
         let mut inner = Inner {
             file: None,
             path,
             level,
             start: Instant::now(),
             log_transcripts,
+            live,
         };
         inner.rotate_if_needed()?;
         Ok(Logger {
@@ -74,6 +82,9 @@ impl Logger {
         let secs = inner.start.elapsed().as_secs_f64();
         let line = format!("[{:>9.3}s] {:<5} {}", secs, level_name(level), sanitize(msg));
         write_line(&mut std::io::stderr(), &line);
+        if let Some(live) = &inner.live {
+            live.push(&line);
+        }
         let _ = inner.rotate_if_needed();
         if let Some(f) = inner.file.as_mut() {
             write_line(f, &line);
@@ -142,6 +153,42 @@ pub(crate) fn write_line<W: std::io::Write>(w: &mut W, line: &str) {
     let _ = writeln!(w, "{line}");
 }
 
+/// Ring buffer of recent log lines, shared with the GUI for live display.
+#[derive(Clone)]
+pub struct LiveLog {
+    inner: Arc<Mutex<VecDeque<String>>>,
+    cap: usize,
+}
+
+impl LiveLog {
+    pub fn new(cap: usize) -> Self {
+        LiveLog {
+            inner: Arc::new(Mutex::new(VecDeque::new())),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Append a line, dropping the oldest when at capacity.
+    pub fn push(&self, line: &str) {
+        let mut q = crate::sync::lock_recover(&self.inner);
+        while q.len() >= self.cap {
+            q.pop_front();
+        }
+        q.push_back(line.to_string());
+    }
+
+    /// Oldest-first snapshot of the buffered lines.
+    pub fn snapshot(&self) -> Vec<String> {
+        crate::sync::lock_recover(&self.inner).iter().cloned().collect()
+    }
+}
+
+/// Copy the current log file to a user-chosen destination (GUI "export").
+pub fn export_log(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::copy(src, dst)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +207,7 @@ mod tests {
             level: Level::Info,
             start: Instant::now(),
             log_transcripts: false,
+            live: None,
         };
         inner.rotate_if_needed().unwrap();
         assert!(path.exists(), "current log must be recreated after rotation");
@@ -185,7 +233,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new(path.clone(), Level::Info, false).unwrap();
+        let logger = Logger::new_with_live(path.clone(), Level::Info, false, None).unwrap();
         let inner = logger.inner.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _g = inner.lock().unwrap();
@@ -203,7 +251,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new(path.clone(), Level::Info, false).unwrap();
+        let logger = Logger::new_with_live(path.clone(), Level::Info, false, None).unwrap();
         logger.info("line1\nline2\x1b[31mRED\tend");
         let content = fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(content.lines().count(), 1, "one log entry = one line (no raw newline)");
@@ -252,7 +300,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new(path.clone(), Level::Info, false).unwrap();
+        let logger = Logger::new_with_live(path.clone(), Level::Info, false, None).unwrap();
         logger.transcript("SECRET");
         let content = fs::read_to_string(&path).unwrap_or_default();
         assert!(!content.contains("SECRET"), "transcripts must not be logged by default");
@@ -265,10 +313,59 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new(path.clone(), Level::Info, true).unwrap();
+        let logger = Logger::new_with_live(path.clone(), Level::Info, true, None).unwrap();
         logger.transcript("HELLO");
         let content = fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("HELLO"), "transcripts must be logged when enabled");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_log_caps_at_limit() {
+        let live = LiveLog::new(3);
+        live.push("1");
+        live.push("2");
+        live.push("3");
+        live.push("4");
+        assert_eq!(
+            live.snapshot(),
+            vec!["2".to_string(), "3".to_string(), "4".to_string()]
+        );
+    }
+
+    #[test]
+    fn live_log_keeps_order() {
+        let live = LiveLog::new(10);
+        live.push("a");
+        live.push("b");
+        assert_eq!(live.snapshot(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn logger_feeds_live_log() {
+        let dir = std::env::temp_dir().join("rapcoding-log-live");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rapcoding.log");
+        let live = LiveLog::new(100);
+        let logger =
+            Logger::new_with_live(path.clone(), Level::Info, false, Some(live.clone())).unwrap();
+        logger.info("hello live");
+        let snap = live.snapshot();
+        assert!(snap.iter().any(|l| l.contains("hello live")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_log_copies_content() {
+        let dir = std::env::temp_dir().join("rapcoding-log-export");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.log");
+        let dst = dir.join("b.log");
+        fs::write(&src, "hello\nexport\n").unwrap();
+        export_log(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello\nexport\n");
         let _ = fs::remove_dir_all(&dir);
     }
 }

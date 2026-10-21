@@ -6,6 +6,7 @@ mod error;
 mod gui;
 mod hotkey;
 mod inject;
+mod journal;
 mod log;
 mod status;
 mod sync;
@@ -20,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use config::Config;
 use error::{Error, Result};
-use log::{Level, Logger};
+use journal::Journal;
+use log::{Level, LiveLog, Logger};
 use status::Status;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -175,14 +177,24 @@ struct WorkResult {
 
 fn cmd_run(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
     let status = Arc::new(Mutex::new(Status::Idle));
-    let daemon = Daemon::start(cfg, &path, verbose, status)?;
+    let journal = Journal::new(config::config_dir().join("journal.log"));
+    let daemon = Daemon::start(cfg, &path, verbose, status, None, &journal)?;
     daemon.run()
 }
 
 #[cfg(feature = "gui")]
 fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
     let status = Arc::new(Mutex::new(Status::Idle));
-    let daemon = Daemon::start(cfg.clone(), &path, verbose, status.clone())?;
+    let live = LiveLog::new(500);
+    let journal = Journal::new(config::config_dir().join("journal.log"));
+    let daemon = Daemon::start(
+        cfg.clone(),
+        &path,
+        verbose,
+        status.clone(),
+        Some(live.clone()),
+        &journal,
+    )?;
     std::thread::Builder::new()
         .name("rapcoding-daemon".into())
         .spawn(move || {
@@ -197,7 +209,7 @@ fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
             }
         })
         .map_err(|e| Error::Gui(format!("daemon thread: {e}")))?;
-    gui::run(cfg, path, status, verbose)
+    gui::run(cfg, path, status, live, journal, verbose)
 }
 
 /// Everything the recognition loop needs. Setup runs synchronously so early
@@ -227,11 +239,14 @@ impl Daemon {
         path: &Path,
         verbose: bool,
         status: Arc<Mutex<Status>>,
+        live: Option<LiveLog>,
+        journal: &Journal,
     ) -> Result<Self> {
         let level = if verbose { Level::Debug } else { Level::Info };
         let log_path = config::config_dir().join("rapcoding.log");
-        let logger = Logger::new(log_path, level, cfg.general.log_transcripts)?;
+        let logger = Logger::new_with_live(log_path, level, cfg.general.log_transcripts, live)?;
         logger.info(&format!("rapcoding {VERSION} starting; config {}", path.display()));
+        journal.append("session", &format!("start; config {}", path.display()));
 
         let mode = parse_mode(&cfg.general.mode)?;
         let audio = audio::AudioCapture::new(&cfg.audio.device)?;
