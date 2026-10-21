@@ -311,6 +311,7 @@ impl GuiApp {
 
     fn start_download(&self, m: &'static download::Model) {
         let state = self.dl_state.clone();
+        let journal = self.journal.clone();
         let root = config::config_dir().join("models");
         let name = m.name.to_string();
         let url = m.url;
@@ -342,8 +343,14 @@ impl GuiApp {
             };
             let _ = std::fs::remove_file(&zip_tmp);
             match result {
-                Ok(()) => set(DlState::Done { name }),
-                Err(e) => set(DlState::Error(e.to_string())),
+                Ok(()) => {
+                    journal.append("download", &format!("ok {name}"));
+                    set(DlState::Done { name });
+                }
+                Err(e) => {
+                    journal.append("download", &format!("fail {name}: {e}"));
+                    set(DlState::Error(e.to_string()));
+                }
             }
         });
     }

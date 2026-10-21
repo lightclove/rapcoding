@@ -4,6 +4,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 
@@ -84,7 +85,14 @@ pub fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(u64, u64)) -> R
 }
 
 fn download_inner(url: &str, dest: &Path, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
-    let resp = ureq::get(url)
+    // Per-read timeout: a stalled connection (server sends nothing) must fail
+    // loudly instead of blocking the download thread forever.
+    let agent = ureq::builder()
+        .timeout_connect(Duration::from_secs(20))
+        .timeout_read(Duration::from_secs(30))
+        .build();
+    let resp = agent
+        .get(url)
         .call()
         .map_err(|e| Error::Download(format!("GET {url}: {e}")))?;
     let status = resp.status();
@@ -94,12 +102,17 @@ fn download_inner(url: &str, dest: &Path, progress: &mut dyn FnMut(u64, u64)) ->
     let total = resp
         .header("Content-Length")
         .and_then(|v| v.parse::<u64>().ok());
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut reader = resp.into_reader();
     let mut file = File::create(dest)?;
     let mut buf = [0u8; 64 * 1024];
     let mut done: u64 = 0;
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| Error::Download(format!("read (stalled?): {e}")))?;
         if n == 0 {
             break;
         }
