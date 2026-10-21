@@ -3,6 +3,13 @@
 ;   1. powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1
 ;   2. ISCC.exe installer\rapcoding.iss
 ; Output: dist\RapcodingSetup-0.1.0.exe
+;
+; NOTE: the installer never downloads models. It only records the user's
+; choice in %APPDATA%\rapcoding\pending-models.txt; the app's GUI downloads
+; them on first launch (real progress bar + bounded 30 s read timeout).
+; Reason: Inno's built-in downloader has no configurable timeout, and the
+; Vosk host stalls after ~16 KB on networks where it is throttled, which made
+; the installer hang forever.
 
 #define MyAppName "rapcoding"
 #define MyAppVersion "0.1.0"
@@ -27,12 +34,14 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 DisableProgramGroupPage=yes
+; Always offer the language choice instead of silently reusing a previous one.
+ShowLanguageDialog=yes
+UsePreviousLanguage=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
-; Preset setup types (the first one is the default).
 [Types]
 Name: "gui"; Description: "С интерфейсом + лёгкие модели (рекомендуется)"
 Name: "console"; Description: "Консольная + лёгкие модели"
@@ -42,7 +51,7 @@ Name: "custom"; Description: "Выборочная установка"; Flags: i
 [Components]
 ; Version: one checkbox — checked = GUI, unchecked = console-only.
 Name: "gui"; Description: "Графический интерфейс (снимите отметку — только консоль)"; Types: gui full custom
-; Models (independent checkboxes; each installs into its own directory).
+; Models: only recorded here; downloaded by the app on first launch.
 Name: "ru_light"; Description: "Русская модель — лёгкая (~44 МБ)"; Types: gui console custom
 Name: "ru_heavy"; Description: "Русская модель — тяжёлая (~1.8 ГБ, точнее)"; Types: full custom
 Name: "en_light"; Description: "Английская модель — лёгкая (~39 МБ)"; Types: gui console custom
@@ -61,92 +70,44 @@ Source: "..\target\release\libgcc_s_seh-1.dll"; DestDir: "{app}"; Flags: ignorev
 Source: "..\target\release\libstdc++-6.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\libwinpthread-1.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "pin-taskbar.ps1"; DestDir: "{app}"; Flags: ignoreversion
-Source: "extract-models.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenu
 
 [Run]
 Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\extract-models.ps1"" -SrcDir ""{tmp}\rapcoding-models"" -Dest ""{userappdata}\rapcoding\models"""; \
-    StatusMsg: "Распаковка моделей распознавания…"; \
-    Flags: runhidden; Check: AnyModelSelected
-Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\pin-taskbar.ps1"" -Target ""{app}\{#MyAppExeName}"""; \
     Tasks: taskbar; Flags: runhidden
 
 [Code]
 var
-  DownloadPage: TDownloadWizardPage;
-  AnyModelDownload: Boolean;
   DeleteUserData: TNewCheckBox;
 
-function AnyModelSelected: Boolean;
+// Record the picked models for the app to download on first launch.
+procedure WritePendingModels;
+var
+  names: String;
 begin
-  Result := IsComponentSelected('ru_light') or IsComponentSelected('ru_heavy')
-         or IsComponentSelected('en_light') or IsComponentSelected('en_heavy');
-end;
-
-// Component selection: IsComponentSelected at install time; in the wizard
-// (interactive) the selection is only committed on the ready page, so use
-// WizardIsComponentSelected there.
-function ModelSelected(const id: String): Boolean;
-begin
-  if WizardSilent then
-    Result := IsComponentSelected(id)
-  else
-    Result := WizardIsComponentSelected(id);
-end;
-
-procedure AddSelectedModels;
-begin
-  DownloadPage.Clear;
-  AnyModelDownload := False;
-  if ModelSelected('ru_light') then begin
-    DownloadPage.Add('https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip', 'rapcoding-models\vosk-model-small-ru-0.22.zip', '');
-    AnyModelDownload := True;
-  end;
-  if ModelSelected('ru_heavy') then begin
-    DownloadPage.Add('https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip', 'rapcoding-models\vosk-model-ru-0.42.zip', '');
-    AnyModelDownload := True;
-  end;
-  if ModelSelected('en_light') then begin
-    DownloadPage.Add('https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip', 'rapcoding-models\vosk-model-small-en-us-0.15.zip', '');
-    AnyModelDownload := True;
-  end;
-  if ModelSelected('en_heavy') then begin
-    DownloadPage.Add('https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip', 'rapcoding-models\vosk-model-en-us-0.22.zip', '');
-    AnyModelDownload := True;
-  end;
-end;
-
-procedure InitializeWizard;
-begin
-  ForceDirectories(ExpandConstant('{tmp}\rapcoding-models'));
-  DownloadPage := CreateDownloadPage('Скачивание моделей', 'Загружаются модели распознавания…', nil);
-  if WizardSilent then
-    AddSelectedModels;
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
-begin
-  Result := True;
-  if CurPageID = wpReady then
-    AddSelectedModels;
+  names := '';
+  if IsComponentSelected('ru_light') then
+    names := names + 'vosk-model-small-ru-0.22' + #13#10;
+  if IsComponentSelected('ru_heavy') then
+    names := names + 'vosk-model-ru-0.42' + #13#10;
+  if IsComponentSelected('en_light') then
+    names := names + 'vosk-model-small-en-us-0.15' + #13#10;
+  if IsComponentSelected('en_heavy') then
+    names := names + 'vosk-model-en-us-0.22' + #13#10;
+  if names = '' then
+    exit;
+  ForceDirectories(ExpandConstant('{userappdata}\rapcoding'));
+  SaveStringToFile(ExpandConstant('{userappdata}\rapcoding\pending-models.txt'),
+    names, False);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
-  if CurStep = ssInstall then begin
-    if AnyModelDownload then begin
-      DownloadPage.Show;
-      try
-        DownloadPage.Download;
-      finally
-        DownloadPage.Hide;
-      end;
-    end;
-  end;
+  if CurStep = ssPostInstall then
+    WritePendingModels;
 end;
 
 procedure InitializeUninstallProgressForm();

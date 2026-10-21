@@ -78,6 +78,7 @@ struct GuiApp {
     applied: Theme,
     persist_error: Option<String>,
     export_error: Option<String>,
+    pending_checked: bool,
 }
 
 pub fn run(
@@ -107,6 +108,7 @@ pub fn run(
         applied: theme,
         persist_error: None,
         export_error: None,
+        pending_checked: false,
     };
     eframe::run_native(
         "rapcoding",
@@ -122,6 +124,10 @@ pub fn run(
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.pending_checked {
+            self.pending_checked = true;
+            self.start_pending_downloads();
+        }
         if self.theme != self.applied {
             ctx.set_visuals(self.theme.visuals());
             self.applied = self.theme;
@@ -307,6 +313,69 @@ impl GuiApp {
                     }
                 }
             });
+    }
+
+    /// Models picked in the installer are queued in `pending-models.txt`.
+    /// Download them on first launch (progress bar here, not in the installer).
+    fn start_pending_downloads(&mut self) {
+        let path = config::config_dir().join("pending-models.txt");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+        let wanted: Vec<&'static download::Model> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .filter_map(|name| download::MODELS.iter().find(|m| m.name == name))
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        let state = self.dl_state.clone();
+        let journal = self.journal.clone();
+        let root = config::config_dir().join("models");
+        journal.append(
+            "download",
+            &format!("queued by installer: {} model(s)", wanted.len()),
+        );
+        std::thread::spawn(move || {
+            let set = |s: DlState| {
+                *sync::lock_recover(&state) = s;
+            };
+            for m in wanted {
+                let name = m.name.to_string();
+                set(DlState::Downloading {
+                    name: name.clone(),
+                    received: 0,
+                    total: m.size_bytes,
+                });
+                let zip_tmp = root.join(format!("{name}.zip.part"));
+                let result = download::download(m.url, &zip_tmp, &mut |done, total| {
+                    set(DlState::Downloading {
+                        name: name.clone(),
+                        received: done,
+                        total,
+                    });
+                })
+                .and_then(|()| {
+                    set(DlState::Extracting { name: name.clone() });
+                    download::extract_zip(&zip_tmp, &root)
+                });
+                let _ = std::fs::remove_file(&zip_tmp);
+                match result {
+                    Ok(()) => journal.append("download", &format!("ok {name}")),
+                    Err(e) => {
+                        journal.append("download", &format!("fail {name}: {e}"));
+                        set(DlState::Error(e.to_string()));
+                        return;
+                    }
+                }
+            }
+            set(DlState::Done {
+                name: "выбранные модели".into(),
+            });
+        });
     }
 
     fn start_download(&self, m: &'static download::Model) {
