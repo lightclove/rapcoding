@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
+use eframe::egui::{self, text::LayoutJob, Color32, CornerRadius, FontId, Margin, RichText, Stroke, TextFormat};
 
 use crate::config::{self, Config};
 use crate::download;
@@ -36,6 +36,7 @@ struct Palette {
     text: Color32,
     muted: Color32,
     accent: Color32,
+    info: Color32,
     success: Color32,
     warn: Color32,
     error: Color32,
@@ -50,6 +51,7 @@ impl Palette {
             text: Color32::from_rgb(0x18, 0x1D, 0x2B),
             muted: Color32::from_rgb(0x6A, 0x73, 0x87),
             accent: Color32::from_rgb(0x53, 0x63, 0xF0),
+            info: Color32::from_rgb(0x0B, 0x72, 0x85),
             success: Color32::from_rgb(0x12, 0xA0, 0x5E),
             warn: Color32::from_rgb(0xE0, 0x82, 0x0B),
             error: Color32::from_rgb(0xD9, 0x2D, 0x20),
@@ -64,6 +66,7 @@ impl Palette {
             text: Color32::from_rgb(0xE7, 0xEB, 0xF3),
             muted: Color32::from_rgb(0x8A, 0x93, 0xA6),
             accent: Color32::from_rgb(0x7B, 0x8B, 0xFF),
+            info: Color32::from_rgb(0x3B, 0xC9, 0xDB),
             success: Color32::from_rgb(0x2E, 0xCC, 0x71),
             warn: Color32::from_rgb(0xF3, 0x9C, 0x12),
             error: Color32::from_rgb(0xF0, 0x52, 0x45),
@@ -240,7 +243,7 @@ pub fn run(
         journal,
         dl_state: Arc::new(Mutex::new(DlState::Idle)),
         dl_cancel: None,
-        page: Page::Overview,
+        page: start_page(),
         theme,
         applied: theme,
         persist_error: None,
@@ -258,6 +261,18 @@ pub fn run(
     )
     .map_err(|e| crate::error::Error::Gui(format!("{e}")))?;
     Ok(0)
+}
+
+/// Initial page, overridable with `RAPCODING_START_PAGE` (design review and
+/// screenshot automation; harmless in normal use).
+fn start_page() -> Page {
+    match std::env::var("RAPCODING_START_PAGE").unwrap_or_default().as_str() {
+        "models" => Page::Models,
+        "help" => Page::Help,
+        "log" => Page::Log,
+        "journal" => Page::Journal,
+        _ => Page::Overview,
+    }
 }
 
 impl eframe::App for GuiApp {
@@ -610,7 +625,7 @@ impl GuiApp {
                 ),
                 (
                     "Ничего не слышно",
-                    "В Windows выберите настоящий микрофон (Параметры → Звук → Ввод), а не «Стерео микшер». Список устройств: rapcoding devices.",
+                    "В Windows выберите настоящий микрофон: Параметры » Звук » Ввод (не «Стерео микшер»). Список устройств: rapcoding devices.",
                 ),
                 (
                     "Не скачивается модель",
@@ -831,19 +846,8 @@ impl GuiApp {
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            // One multi-line block keeps the line rhythm even;
-                            // per-line labels pick up item_spacing and look uneven.
-                            let text = self.live.snapshot().join("\n");
-                            ui.label(
-                                RichText::new(if text.is_empty() {
-                                    "Пока нет записей.".to_string()
-                                } else {
-                                    text
-                                })
-                                .monospace()
-                                .size(11.5)
-                                .color(p.text),
-                            );
+                            let job = styled_log(&self.live.snapshot(), &p);
+                            ui.label(job);
                         });
                 });
         });
@@ -871,12 +875,8 @@ impl GuiApp {
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            let text = if entries.is_empty() {
-                                "Пока пусто.".to_string()
-                            } else {
-                                entries.join("\n")
-                            };
-                            ui.label(RichText::new(text).monospace().size(11.5).color(p.text));
+                            let job = styled_journal(&entries, &p);
+                            ui.label(job);
                         });
                 });
         });
@@ -1050,6 +1050,123 @@ fn model_line(ui: &mut egui::Ui, p: Palette, lang: &str, value: &str) {
     });
 }
 
+// ------------------------------------------------- styled log / journal
+
+/// Split a leading `[...]` stamp: `"[ts] body"` -> `(Some("[ts]"), " body")`.
+fn split_stamp(line: &str) -> (Option<&str>, &str) {
+    if let Some(end) = line.strip_prefix('[').and_then(|r| r.find(']')) {
+        let cut = end + 2; // '[' + chars + ']'
+        (Some(&line[..cut]), &line[cut..])
+    } else {
+        (None, line)
+    }
+}
+
+/// Split `" kind rest"` -> `(" ", "kind", " rest")` (leading space kept).
+fn split_kind(rest: &str) -> (&str, &str, &str) {
+    let body = rest.trim_start();
+    let lead = &rest[..rest.len() - body.len()];
+    match body.find(' ') {
+        Some(i) => (lead, &body[..i], &body[i..]),
+        None => (lead, body, ""),
+    }
+}
+
+fn fmt(color: Color32) -> TextFormat {
+    TextFormat {
+        font_id: FontId::monospace(11.5),
+        color,
+        ..Default::default()
+    }
+}
+
+/// Colour of a journal event kind (and its outcome) in the current theme.
+fn journal_color(kind: &str, msg: &str, p: &Palette) -> Color32 {
+    match kind {
+        "session" => p.accent,
+        "config" => p.info,
+        "log" => p.muted,
+        "download" => {
+            let m = msg.trim_start();
+            if m.starts_with("ok") {
+                p.success
+            } else if m.starts_with("fail") {
+                p.error
+            } else if m.starts_with("canceled") {
+                p.muted
+            } else {
+                p.warn
+            }
+        }
+        _ => p.text,
+    }
+}
+
+/// Colour of a log level.
+fn log_color(level: &str, p: &Palette) -> Color32 {
+    match level {
+        "WARN" => p.warn,
+        "DEBUG" => p.muted,
+        _ => p.info,
+    }
+}
+
+fn styled_journal(entries: &[String], p: &Palette) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    if entries.is_empty() {
+        job.append("Пока пусто.", 0.0, fmt(p.muted));
+        return job;
+    }
+    for (i, line) in entries.iter().enumerate() {
+        if i > 0 {
+            job.append("\n", 0.0, fmt(p.text));
+        }
+        let (stamp, rest) = split_stamp(line);
+        if let Some(s) = stamp {
+            job.append(s, 0.0, fmt(p.muted));
+        }
+        let (lead, kind, msg) = split_kind(rest);
+        if !lead.is_empty() {
+            job.append(lead, 0.0, fmt(p.muted));
+        }
+        if !kind.is_empty() {
+            job.append(kind, 0.0, fmt(journal_color(kind, msg, p)));
+        }
+        if !msg.is_empty() {
+            job.append(msg, 0.0, fmt(p.text));
+        }
+    }
+    job
+}
+
+fn styled_log(lines: &[String], p: &Palette) -> LayoutJob {
+    let mut job = LayoutJob::default();
+    if lines.is_empty() {
+        job.append("Пока нет записей.", 0.0, fmt(p.muted));
+        return job;
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if i > 0 {
+            job.append("\n", 0.0, fmt(p.text));
+        }
+        let (stamp, rest) = split_stamp(line);
+        if let Some(s) = stamp {
+            job.append(s, 0.0, fmt(p.muted));
+        }
+        let (lead, level, msg) = split_kind(rest);
+        if !lead.is_empty() {
+            job.append(lead, 0.0, fmt(p.muted));
+        }
+        if !level.is_empty() {
+            job.append(level, 0.0, fmt(log_color(level, p)));
+        }
+        if !msg.is_empty() {
+            job.append(msg, 0.0, fmt(p.text));
+        }
+    }
+    job
+}
+
 /// "ctrl+alt+space" -> "Ctrl + Alt + Space" for readability.
 fn pretty_hotkey(s: &str) -> String {
     s.split('+')
@@ -1068,6 +1185,64 @@ fn pretty_hotkey(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_stamp_handles_journal_line() {
+        let (stamp, rest) = split_stamp("[2026-10-21T00:00:00Z] session start");
+        assert_eq!(stamp, Some("[2026-10-21T00:00:00Z]"));
+        assert_eq!(rest, " session start");
+    }
+
+    #[test]
+    fn split_stamp_without_bracket() {
+        let (stamp, rest) = split_stamp("plain line");
+        assert_eq!(stamp, None);
+        assert_eq!(rest, "plain line");
+    }
+
+    #[test]
+    fn split_kind_extracts_token() {
+        assert_eq!(split_kind(" session start"), (" ", "session", " start"));
+        assert_eq!(split_kind(" INFO  hello"), (" ", "INFO", "  hello"));
+        assert_eq!(split_kind("alone"), ("", "alone", ""));
+    }
+
+    #[test]
+    fn journal_colors_by_kind() {
+        let p = Palette::light();
+        assert_eq!(journal_color("session", " start", &p), p.accent);
+        assert_eq!(journal_color("config", " theme", &p), p.info);
+        assert_eq!(journal_color("log", " export", &p), p.muted);
+        assert_eq!(journal_color("download", " ok model", &p), p.success);
+        assert_eq!(journal_color("download", " fail model", &p), p.error);
+        assert_eq!(journal_color("download", " start model", &p), p.warn);
+        assert_eq!(journal_color("download", " canceled model", &p), p.muted);
+    }
+
+    #[test]
+    fn log_colors_by_level() {
+        let p = Palette::dark();
+        assert_eq!(log_color("WARN", &p), p.warn);
+        assert_eq!(log_color("DEBUG", &p), p.muted);
+        assert_eq!(log_color("INFO", &p), p.info);
+    }
+
+    #[test]
+    fn styled_journal_keeps_text_intact() {
+        // Colouring must not drop or reorder characters.
+        let p = Palette::light();
+        let lines = vec!["[ts] download ok model".to_string()];
+        let job = styled_journal(&lines, &p);
+        assert_eq!(job.text, "[ts] download ok model");
+    }
+
+    #[test]
+    fn styled_log_keeps_text_intact() {
+        let p = Palette::dark();
+        let lines = vec!["[  1.000s] INFO  hello".to_string()];
+        let job = styled_log(&lines, &p);
+        assert_eq!(job.text, "[  1.000s] INFO  hello");
+    }
 
     #[test]
     fn pretty_hotkey_capitalizes() {
