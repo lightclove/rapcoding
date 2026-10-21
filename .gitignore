@@ -1,0 +1,16 @@
+# Build artifacts
+target/
+dist/
+node_modules/
+
+# Local harness/tooling (kept out of the public repo)
+.agents/
+.pi/
+.serena/
+.zed/
+tools/
+.playwright-mcp/
+
+# Local docs and logs
+docs/
+*.log
