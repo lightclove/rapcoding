@@ -147,28 +147,37 @@ impl Theme {
 enum Page {
     Overview,
     Models,
+    Help,
     Log,
     Journal,
 }
 
 impl Page {
-    const ALL: [Page; 4] = [Page::Overview, Page::Models, Page::Log, Page::Journal];
+    const ALL: [Page; 5] = [
+        Page::Overview,
+        Page::Models,
+        Page::Help,
+        Page::Log,
+        Page::Journal,
+    ];
 
     fn title(self) -> &'static str {
         match self {
             Page::Overview => "Обзор",
             Page::Models => "Модели",
+            Page::Help => "Инструкция",
             Page::Log => "Лог",
             Page::Journal => "Журнал",
         }
     }
 
-    fn icon(self) -> &'static str {
+    fn hint(self) -> &'static str {
         match self {
-            Page::Overview => "◈",
-            Page::Models => "◍",
-            Page::Log => "≡",
-            Page::Journal => "◷",
+            Page::Overview => "Статус, хоткеи и активные модели",
+            Page::Models => "Скачать модель, сделать её активной",
+            Page::Help => "Пошаговая инструкция и голосовые команды",
+            Page::Log => "Живой лог программы и экспорт в файл",
+            Page::Journal => "История изменений настроек и загрузок",
         }
     }
 }
@@ -218,7 +227,7 @@ pub fn run(
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([460.0, 340.0])
+            .with_min_inner_size([760.0, 460.0])
             .with_resizable(true)
             .with_title("rapcoding"),
         ..Default::default()
@@ -263,15 +272,14 @@ impl eframe::App for GuiApp {
             self.theme.style(ctx);
         }
         let p = self.theme.palette();
-        let compact = ctx.screen_rect().width() < 900.0;
         let busy = sync::lock_recover(&self.dl_state).is_busy();
         if busy {
             // Repaint while downloading so the progress bar stays live.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        self.header(ctx, p, compact);
-        self.nav(ctx, p, compact);
+        self.header(ctx, p);
+        self.nav(ctx, p);
 
         egui::CentralPanel::default()
             .frame(
@@ -285,6 +293,7 @@ impl eframe::App for GuiApp {
                     .show(ui, |ui| match self.page {
                         Page::Overview => self.overview(ui, p),
                         Page::Models => self.models(ui, p),
+                        Page::Help => Self::help(ui, p),
                         Page::Log => self.logs(ui, p),
                         Page::Journal => self.journal_page(ui, p),
                     });
@@ -295,7 +304,7 @@ impl eframe::App for GuiApp {
 impl GuiApp {
     // ------------------------------------------------------------- chrome
 
-    fn header(&mut self, ctx: &egui::Context, p: Palette, compact: bool) {
+    fn header(&mut self, ctx: &egui::Context, p: Palette) {
         egui::TopBottomPanel::top("header")
             .exact_height(64.0)
             .frame(
@@ -306,27 +315,25 @@ impl GuiApp {
             )
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("rapcoding").size(20.0).strong().color(p.text));
-                    if !compact {
-                        ui.label(
-                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .size(12.0)
-                                .color(p.muted),
-                        );
-                    }
+                    ui.label(RichText::new("rapcoding").size(20.0).strong().color(p.text))
+                        .on_hover_text("Голосовой ввод: говорите — текст печатается само");
+                    ui.label(
+                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                            .size(12.0)
+                            .color(p.muted),
+                    );
                     ui.add_space(12.0);
                     self.status_pill(ui, p);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let (icon, label) = match self.theme {
-                            Theme::Light => ("🌙", "Тёмная тема"),
-                            Theme::Dark => ("☀", "Светлая тема"),
+                        let label = match self.theme {
+                            Theme::Light => "Тёмная тема",
+                            Theme::Dark => "Светлая тема",
                         };
-                        let text = if compact {
-                            icon.to_string()
-                        } else {
-                            format!("{icon}  {label}")
-                        };
-                        if ui.button(text).clicked() {
+                        if ui
+                            .button(label)
+                            .on_hover_text("Переключить оформление (сохраняется в конфиг)")
+                            .clicked()
+                        {
                             self.theme = self.theme.toggle();
                             self.cfg.gui.theme = self.theme.as_str().to_string();
                             self.journal
@@ -343,36 +350,47 @@ impl GuiApp {
 
     fn status_pill(&self, ui: &mut egui::Ui, p: Palette) {
         let st = sync::lock_recover(&self.status).clone();
-        let (color, text) = match &st {
-            Status::Idle => (p.success, "Готов"),
-            Status::Listening(l) => (p.success, if *l == "en" { "Слушаю · EN" } else { "Слушаю · RU" }),
-            Status::Transcribing(l) => (p.warn, if *l == "en" { "Распознаю · EN" } else { "Распознаю · RU" }),
-            Status::Error(_) => (p.error, "Ошибка"),
+        let (color, text, hint) = match &st {
+            Status::Idle => (p.success, "Готов", "Жду нажатия хоткея"),
+            Status::Listening(l) => (
+                p.success,
+                if *l == "en" { "Слушаю · EN" } else { "Слушаю · RU" },
+                "Идёт запись — говорите и отпустите хоткей",
+            ),
+            Status::Transcribing(l) => (
+                p.warn,
+                if *l == "en" { "Распознаю · EN" } else { "Распознаю · RU" },
+                "Распознавание речи, обычно около секунды",
+            ),
+            Status::Error(_) => (p.error, "Ошибка", "Подробности — в разделе «Лог»"),
         };
-        egui::Frame::new()
+        let frame = egui::Frame::new()
             .fill(color.gamma_multiply(0.14))
             .corner_radius(CornerRadius::same(20))
             .inner_margin(Margin::symmetric(12, 5))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("●").size(11.0).color(color));
+                    // A drawn dot: the default font has no bullet glyph.
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+                    ui.painter().circle_filled(rect.center(), 4.5, color);
                     ui.label(RichText::new(text).size(13.0).color(color).strong());
                 });
             });
+        frame.response.on_hover_text(hint);
         if let Status::Error(msg) = &st {
             ui.label(RichText::new(msg).size(12.0).color(p.error));
         }
     }
 
-    fn nav(&mut self, ctx: &egui::Context, p: Palette, compact: bool) {
-        let width = if compact { 68.0 } else { 180.0 };
+    fn nav(&mut self, ctx: &egui::Context, p: Palette) {
         egui::SidePanel::left("nav")
-            .exact_width(width)
+            .exact_width(190.0)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(p.surface)
-                    .inner_margin(Margin::symmetric(if compact { 8 } else { 10 }, 16))
+                    .inner_margin(Margin::symmetric(10, 16))
                     .stroke(Stroke::new(1.0_f32, p.stroke)),
             )
             .show(ctx, |ui| {
@@ -386,29 +404,14 @@ impl GuiApp {
                     let resp = egui::Frame::new()
                         .fill(fill)
                         .corner_radius(CornerRadius::same(9))
-                        .inner_margin(Margin::symmetric(if compact { 6 } else { 12 }, 9))
+                        .inner_margin(Margin::symmetric(12, 9))
                         .show(ui, |ui| {
-                            if compact {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(RichText::new(page.icon()).size(16.0).color(color));
-                                });
-                            } else {
-                                ui.horizontal(|ui| {
-                                    ui.label(RichText::new(page.icon()).size(14.0).color(color));
-                                    ui.label(
-                                        RichText::new(page.title())
-                                            .size(14.0)
-                                            .color(color)
-                                            .strong(),
-                                    );
-                                });
-                            }
+                            ui.label(RichText::new(page.title()).size(14.0).color(color).strong());
                         })
                         .response;
-                    let resp = resp.interact(egui::Sense::click());
-                    if compact {
-                        resp.clone().on_hover_text(page.title());
-                    }
+                    let resp = resp
+                        .interact(egui::Sense::click())
+                        .on_hover_text(page.hint());
                     if resp.clicked() {
                         self.page = page;
                     }
@@ -416,25 +419,27 @@ impl GuiApp {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
-                if !compact {
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        if !self.cfg.gui.enabled {
-                            ui.label(
-                                RichText::new("консольный режим")
-                                    .size(11.0)
-                                    .color(p.muted),
-                            );
-                        }
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    if !self.cfg.gui.enabled {
                         ui.label(
-                            RichText::new(match self.cfg.general.mode.as_str() {
-                                "toggle" => "режим: toggle",
-                                _ => "режим: hold",
-                            })
-                            .size(11.0)
-                            .color(p.muted),
-                        );
-                    });
-                }
+                            RichText::new("консольный режим")
+                                .size(11.0)
+                                .color(p.muted),
+                        )
+                        .on_hover_text("gui.enabled = false — окно отключено в конфиге");
+                    }
+                    ui.label(
+                        RichText::new(match self.cfg.general.mode.as_str() {
+                            "toggle" => "режим: toggle",
+                            _ => "режим: hold",
+                        })
+                        .size(11.0)
+                        .color(p.muted),
+                    )
+                    .on_hover_text(
+                        "hold — запись, пока держите клавиши; toggle — нажатие включает и выключает",
+                    );
+                });
             });
     }
 
@@ -490,21 +495,30 @@ impl GuiApp {
         });
 
         ui.add_space(12.0);
-        if ui.available_width() >= 720.0 {
-            ui.columns(2, |cols| {
-                self.models_card(&mut cols[0], p);
-                self.mode_card(&mut cols[1], p);
-            });
-        } else {
-            self.models_card(ui, p);
-            ui.add_space(12.0);
-            self.mode_card(ui, p);
-        }
+        self.models_card(ui, p);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(match self.cfg.inject.method.as_str() {
+                    "type" => "Вставка: печать текста напрямую",
+                    _ => "Вставка: через буфер обмена",
+                })
+                .size(11.5)
+                .color(p.muted),
+            )
+            .on_hover_text(
+                "inject.method в конфиге: paste — вставка через буфер (по умолчанию), type — печать посимвольно",
+            );
+            if !self.cfg.inject.enabled {
+                ui.label(RichText::new("· вставка отключена").size(11.5).color(p.error))
+                    .on_hover_text("inject.enabled = false — текст не вставляется");
+            }
+        });
     }
 
     fn models_card(&self, ui: &mut egui::Ui, p: Palette) {
         Self::card(ui, p, |ui| {
-            Self::section_title(ui, p, "МОДЕЛИ");
+            Self::section_title(ui, p, "АКТИВНЫЕ МОДЕЛИ");
             ui.add_space(6.0);
             model_line(ui, p, "RU", &self.cfg.asr.model);
             ui.add_space(6.0);
@@ -512,36 +526,105 @@ impl GuiApp {
         });
     }
 
-    fn mode_card(&self, ui: &mut egui::Ui, p: Palette) {
+    // ---------------------------------------------------------------- help
+
+    fn help(ui: &mut egui::Ui, p: Palette) {
         Self::card(ui, p, |ui| {
-            Self::section_title(ui, p, "ВСТАВКА И РЕЖИМ");
-            ui.add_space(6.0);
-            kv(
-                ui,
-                p,
-                "Метод",
-                if self.cfg.inject.method == "type" {
-                    "печать"
-                } else {
-                    "буфер обмена"
-                },
+            ui.label(RichText::new("Как пользоваться").size(18.0).strong().color(p.text));
+            ui.add_space(10.0);
+            let steps = [
+                (
+                    "1. Подготовьте модель",
+                    "Откройте «Модели», нажмите «Скачать», дождитесь окончания, затем — «Сделать активной». Перезапустите программу.",
+                ),
+                (
+                    "2. Поставьте курсор",
+                    "Кликните в то место любого окна, куда должен появиться текст: редактор, браузер, мессенджер, терминал.",
+                ),
+                (
+                    "3. Зажмите хоткей и говорите",
+                    "Держите клавиши, пока говорите. Индикатор вверху показывает «Слушаю». Отпустите — начнётся распознавание.",
+                ),
+                (
+                    "4. Текст появится сам",
+                    "Через секунду текст напечатается в том окне, где был курсор. Не переключайте окна в этот момент.",
+                ),
+            ];
+            for (title, body) in steps {
+                ui.label(RichText::new(title).size(13.5).strong().color(p.text));
+                ui.label(RichText::new(body).size(12.5).color(p.muted));
+                ui.add_space(10.0);
+            }
+        });
+
+        ui.add_space(12.0);
+        Self::card(ui, p, |ui| {
+            ui.label(
+                RichText::new("Голосовые команды")
+                    .size(16.0)
+                    .strong()
+                    .color(p.text),
             );
-            kv(
-                ui,
-                p,
-                "Режим",
-                if self.cfg.general.mode == "toggle" {
-                    "toggle"
-                } else {
-                    "hold"
-                },
+            ui.label(
+                RichText::new(
+                    "Скажите фразу — она заменится символом. Смешивать языки в одной фразе нельзя.",
+                )
+                .size(12.5)
+                .color(p.muted),
             );
-            kv(
-                ui,
-                p,
-                "Вставка включена",
-                if self.cfg.inject.enabled { "да" } else { "нет" },
+            ui.add_space(10.0);
+            egui::Grid::new("voice_cmds")
+                .num_columns(4)
+                .spacing([16.0, 8.0])
+                .show(ui, |ui| {
+                    for (ru, en) in [
+                        ("новая строка", "new line"),
+                        ("новый абзац", "new paragraph"),
+                        ("открыть скобку", "open parenthesis"),
+                        ("закрыть скобку", "close parenthesis"),
+                        ("двойное двоеточие", "double colon"),
+                        ("точка с запятой", "fat arrow"),
+                    ] {
+                        ui.label(RichText::new(ru).size(12.5).color(p.text));
+                        ui.label(RichText::new(en).monospace().size(12.0).color(p.muted));
+                        ui.label("");
+                        ui.label("");
+                        ui.end_row();
+                    }
+                });
+        });
+
+        ui.add_space(12.0);
+        Self::card(ui, p, |ui| {
+            ui.label(
+                RichText::new("Если не работает")
+                    .size(16.0)
+                    .strong()
+                    .color(p.text),
             );
+            ui.add_space(8.0);
+            for (q, a) in [
+                (
+                    "Текст не появляется",
+                    "Проверьте статус вверху: «Ошибка» — смотрите «Лог». Убедитесь, что модель активна.",
+                ),
+                (
+                    "Ничего не слышно",
+                    "В Windows выберите настоящий микрофон (Параметры → Звук → Ввод), а не «Стерео микшер». Список устройств: rapcoding devices.",
+                ),
+                (
+                    "Не скачивается модель",
+                    "Сайт Vosk может быть недоступен без VPN. Скачайте zip вручную и распакуйте в %APPDATA%\\rapcoding\\models.",
+                ),
+                (
+                    "Не работает в программе от администратора",
+                    "Windows блокирует ввод из обычного процесса в привилегированный: запустите rapcoding тоже от администратора.",
+                ),
+            ] {
+                ui.label(RichText::new(q).size(13.0).strong().color(p.text));
+                ui.label(RichText::new(a).size(12.5).color(p.muted));
+                ui.add_space(9.0);
+            }
         });
     }
 
@@ -599,7 +682,11 @@ impl GuiApp {
                 ui.add_space(10.0);
                 ui.horizontal_wrapped(|ui| {
                     if is_current && busy {
-                        if ui.button("Стоп").clicked() {
+                        if ui
+                            .button("Остановить")
+                            .on_hover_text("Прервать загрузку и удалить неполный файл")
+                            .clicked()
+                        {
                             if let Some(flag) = &self.dl_cancel {
                                 flag.store(true, Ordering::Relaxed);
                             }
@@ -607,12 +694,21 @@ impl GuiApp {
                     } else if !installed {
                         if ui
                             .add_enabled(!busy, egui::Button::new("Скачать"))
+                            .on_hover_text(
+                                "Скачать модель с сайта Vosk (нужен интернет; размер указан рядом)",
+                            )
                             .clicked()
                         {
                             self.start_download(m);
                         }
                     } else if !active {
-                        if ui.button("Сделать активной").clicked() {
+                        if ui
+                            .button("Сделать активной")
+                            .on_hover_text(
+                                "Запишет модель в asr.model / asr.en_model; применится после перезапуска",
+                            )
+                            .clicked()
+                        {
                             self.activate_model(m);
                         }
                     }
@@ -663,7 +759,7 @@ impl GuiApp {
             DlState::Done { name } => {
                 Self::card(ui, p, |ui| {
                     ui.label(
-                        RichText::new(format!("✓ {name}: скачивание завершено"))
+                        RichText::new(format!("{name}: скачивание завершено"))
                             .size(13.0)
                             .color(p.success)
                             .strong(),
@@ -732,11 +828,22 @@ impl GuiApp {
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .max_height(460.0)
+                        .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            for line in self.live.snapshot() {
-                                ui.label(RichText::new(line).monospace().size(11.5).color(p.text));
-                            }
+                            // One multi-line block keeps the line rhythm even;
+                            // per-line labels pick up item_spacing and look uneven.
+                            let text = self.live.snapshot().join("\n");
+                            ui.label(
+                                RichText::new(if text.is_empty() {
+                                    "Пока нет записей.".to_string()
+                                } else {
+                                    text
+                                })
+                                .monospace()
+                                .size(11.5)
+                                .color(p.text),
+                            );
                         });
                 });
         });
@@ -744,21 +851,34 @@ impl GuiApp {
 
     fn journal_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         Self::card(ui, p, |ui| {
-            ui.label(RichText::new("Журнал управления").size(16.0).strong().color(p.text));
+            ui.label(
+                RichText::new("Журнал управления")
+                    .size(16.0)
+                    .strong()
+                    .color(p.text),
+            )
+            .on_hover_text("Старт сессий, смена темы, загрузка моделей и активация");
             ui.add_space(8.0);
             let entries = self.journal.read();
-            if entries.is_empty() {
-                ui.label(RichText::new("Пока пусто.").size(13.0).color(p.muted));
-            } else {
-                egui::ScrollArea::vertical()
-                    .max_height(460.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in entries {
-                            ui.label(RichText::new(line).monospace().size(11.5).color(p.text));
-                        }
-                    });
-            }
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(p.bg)
+                .corner_radius(CornerRadius::same(10))
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .max_height(440.0)
+                        .auto_shrink([false, false])
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            let text = if entries.is_empty() {
+                                "Пока пусто.".to_string()
+                            } else {
+                                entries.join("\n")
+                            };
+                            ui.label(RichText::new(text).monospace().size(11.5).color(p.text));
+                        });
+                });
         });
     }
 
@@ -917,14 +1037,6 @@ fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
         });
 }
 
-fn kv(ui: &mut egui::Ui, p: Palette, key: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(key).size(12.5).color(p.muted));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new(value).size(12.5).color(p.text));
-        });
-    });
-}
 
 fn model_line(ui: &mut egui::Ui, p: Palette, lang: &str, value: &str) {
     ui.horizontal(|ui| {
