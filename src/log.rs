@@ -73,11 +73,10 @@ impl Logger {
         }
         let secs = inner.start.elapsed().as_secs_f64();
         let line = format!("[{:>9.3}s] {:<5} {}", secs, level_name(level), sanitize(msg));
-        // Fallible write: a broken stderr pipe must not crash the daemon.
-        let _ = writeln!(std::io::stderr(), "{line}");
+        write_line(&mut std::io::stderr(), &line);
         let _ = inner.rotate_if_needed();
         if let Some(f) = inner.file.as_mut() {
-            let _ = writeln!(f, "{line}");
+            write_line(f, &line);
             let _ = f.flush();
         }
     }
@@ -135,6 +134,12 @@ pub(crate) fn sanitize(msg: &str) -> String {
         }
     }
     out
+}
+
+/// Write a line to a sink, swallowing I/O errors so a broken pipe or a closed
+/// stream can never panic a caller (the daemon loop or the audio thread).
+pub(crate) fn write_line<W: std::io::Write>(w: &mut W, line: &str) {
+    let _ = writeln!(w, "{line}");
 }
 
 #[cfg(test)]
@@ -214,6 +219,31 @@ mod tests {
         assert_eq!(sanitize("x\t\r"), "x\\t\\r");
         assert_eq!(sanitize("a\x1b[31m"), "a\\x1b[31m");
         assert_eq!(sanitize("plain"), "plain");
+    }
+
+    struct BrokenWriter;
+
+    impl std::io::Write for BrokenWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "broken pipe",
+            ))
+        }
+    }
+
+    #[test]
+    fn write_line_never_panics_on_broken_writer() {
+        let mut w = BrokenWriter;
+        // Must not panic even though every write fails.
+        write_line(&mut w, "hello");
+        write_line(&mut w, "a\nb\x1b[31m");
     }
 
     #[test]

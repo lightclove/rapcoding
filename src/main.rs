@@ -9,7 +9,6 @@ mod sync;
 mod text;
 mod wav;
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -28,10 +27,9 @@ fn main() {
         Err(e) => {
             // Fallible + sanitized: never panic while reporting, and never let
             // a control char in an error message forge/color the terminal.
-            let _ = writeln!(
-                std::io::stderr(),
-                "rapcoding error: {}",
-                log::sanitize(&e.to_string())
+            log::write_line(
+                &mut std::io::stderr(),
+                &format!("rapcoding error: {}", log::sanitize(&e.to_string())),
             );
             1
         }

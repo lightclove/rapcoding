@@ -166,7 +166,20 @@ pub fn default_chord() -> PasteChord {
     }
 }
 
-fn send_chord(e: &mut Enigo, c: PasteChord) -> Result<()> {
+/// Keyboard sink, abstracted so `send_chord` is unit-testable without a real
+/// input device (H3: the contract lives at the interface).
+trait KeySink {
+    fn key(&mut self, key: Key, direction: Direction) -> Result<()>;
+}
+
+impl KeySink for Enigo {
+    fn key(&mut self, key: Key, direction: Direction) -> Result<()> {
+        Keyboard::key(self, key, direction)
+            .map_err(|err| Error::Inject(format!("keyboard: {err}")))
+    }
+}
+
+fn send_chord<S: KeySink>(e: &mut S, c: PasteChord) -> Result<()> {
     let mut ctrl_down = false;
     let mut meta_down = false;
     let mut alt_down = false;
@@ -174,27 +187,22 @@ fn send_chord(e: &mut Enigo, c: PasteChord) -> Result<()> {
 
     let result = (|| -> Result<()> {
         if c.ctrl {
-            e.key(Key::Control, Direction::Press)
-                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            e.key(Key::Control, Direction::Press)?;
             ctrl_down = true;
         }
         if c.meta {
-            e.key(Key::Meta, Direction::Press)
-                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            e.key(Key::Meta, Direction::Press)?;
             meta_down = true;
         }
         if c.alt {
-            e.key(Key::Alt, Direction::Press)
-                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            e.key(Key::Alt, Direction::Press)?;
             alt_down = true;
         }
         if c.shift {
-            e.key(Key::Shift, Direction::Press)
-                .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+            e.key(Key::Shift, Direction::Press)?;
             shift_down = true;
         }
-        e.key(Key::Unicode(c.key), Direction::Click)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))?;
+        e.key(Key::Unicode(c.key), Direction::Click)?;
         Ok(())
     })();
 
@@ -240,5 +248,58 @@ mod tests {
     fn default_chord_is_valid() {
         let c = default_chord();
         assert!(c.key == 'v');
+    }
+
+    struct MockSink {
+        pressed: usize,
+        released: usize,
+        fail_on: Option<usize>,
+        calls: usize,
+    }
+
+    impl KeySink for MockSink {
+        fn key(&mut self, _key: Key, direction: Direction) -> Result<()> {
+            self.calls += 1;
+            if self.fail_on == Some(self.calls) {
+                return Err(Error::Inject("mock failure".into()));
+            }
+            match direction {
+                Direction::Press => self.pressed += 1,
+                Direction::Release => self.released += 1,
+                Direction::Click => {}
+            }
+            Ok(())
+        }
+    }
+
+    fn chord(ctrl: bool, shift: bool) -> PasteChord {
+        PasteChord {
+            ctrl,
+            shift,
+            alt: false,
+            meta: false,
+            key: 'v',
+        }
+    }
+
+    #[test]
+    fn send_chord_releases_modifiers_on_success() {
+        let mut sink = MockSink { pressed: 0, released: 0, fail_on: None, calls: 0 };
+        assert!(send_chord(&mut sink, chord(true, true)).is_ok());
+        assert_eq!(sink.pressed, 2);
+        assert_eq!(sink.released, 2, "every pressed modifier must be released");
+    }
+
+    #[test]
+    fn send_chord_releases_modifiers_on_failure() {
+        // ctrl+shift+v: calls are [ctrl press, shift press, v click, …].
+        // Fail on the click (3rd call) — both modifiers must still be released.
+        let mut sink = MockSink { pressed: 0, released: 0, fail_on: Some(3), calls: 0 };
+        assert!(send_chord(&mut sink, chord(true, true)).is_err());
+        assert_eq!(
+            sink.pressed, sink.released,
+            "released must equal pressed even on failure"
+        );
+        assert!(sink.released > 0);
     }
 }
