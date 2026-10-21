@@ -29,3 +29,7 @@ method = "paste"           # "paste" | "type"
 paste_shortcut = ""        # empty = platform default (ctrl+v / cmd+v); e.g. "ctrl+shift+v" for terminals
 restore_clipboard = true
 settle_ms = 300            # wait after paste before restoring the clipboard
+
+[gui]
+enabled = true             # false = console-only mode (no window)
+theme = "dark"             # "dark" | "light"

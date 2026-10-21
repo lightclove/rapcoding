@@ -15,6 +15,7 @@ pub struct Config {
     pub asr: Asr,
     pub text: Text,
     pub inject: Inject,
+    pub gui: Gui,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -66,6 +67,13 @@ pub struct Inject {
     pub settle_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Gui {
+    pub enabled: bool,
+    pub theme: String,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -74,6 +82,7 @@ impl Default for Config {
             asr: Asr::default(),
             text: Text::default(),
             inject: Inject::default(),
+            gui: Gui::default(),
         }
     }
 }
@@ -133,6 +142,15 @@ impl Default for Inject {
     }
 }
 
+impl Default for Gui {
+    fn default() -> Self {
+        Gui {
+            enabled: true,
+            theme: "dark".into(),
+        }
+    }
+}
+
 impl Config {
     /// Semantic validation beyond serde's shape checks.
     pub fn validate(&self) -> Result<()> {
@@ -186,6 +204,12 @@ impl Config {
         }
         if self.inject.settle_ms > 10_000 {
             return Err(Error::Config("inject.settle_ms must be <= 10000".into()));
+        }
+        if !matches!(self.gui.theme.as_str(), "dark" | "light") {
+            return Err(Error::Config(format!(
+                "gui.theme must be 'dark' or 'light', got '{}'",
+                self.gui.theme
+            )));
         }
         Ok(())
     }
@@ -363,5 +387,19 @@ mod tests {
         let s = "[audio]\nsample_rate = 48000\n";
         let cfg: Config = toml::from_str(s).unwrap();
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn invalid_gui_theme_rejected() {
+        let mut c = Config::default();
+        c.gui.theme = "blue".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn gui_can_be_disabled() {
+        let mut c = Config::default();
+        c.gui.enabled = false;
+        c.validate().expect("disabled gui must be valid");
     }
 }
