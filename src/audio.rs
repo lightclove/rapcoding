@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -142,12 +142,26 @@ where
 {
     let s = shared.clone();
     let ch = channels as usize;
-    let err = |e: cpal::Error| {
-        // Fallible write: a broken stderr pipe must not panic the audio thread.
-        crate::log::write_line(
-            &mut std::io::stderr(),
-            &format!("audio stream error: {}", crate::log::sanitize(&e.to_string())),
-        );
+    // Rate-limit stream errors: a WASAPI buffer underrun/overrun is non-fatal
+    // and can fire in bursts, but one line per ~2 s is enough signal.
+    let last_err = Arc::new(AtomicU64::new(0));
+    let err = {
+        let last_err = last_err.clone();
+        move |e: cpal::Error| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let last = last_err.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= 2 {
+                last_err.store(now, Ordering::Relaxed);
+                // Fallible write: a broken stderr pipe must not panic the audio thread.
+                crate::log::write_line(
+                    &mut std::io::stderr(),
+                    &format!("audio stream error: {}", crate::log::sanitize(&e.to_string())),
+                );
+            }
+        }
     };
     let cb = move |data: &[T], _info: &cpal::InputCallbackInfo| {
         if !s.recording.load(Ordering::Relaxed) {

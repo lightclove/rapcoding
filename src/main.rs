@@ -289,6 +289,21 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
     }
 }
 
+/// Run CPU-heavy transcription at below-normal priority so the real-time
+/// WASAPI audio thread is not starved (which surfaces as buffer underruns).
+#[cfg(target_os = "windows")]
+fn lower_worker_priority() {
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL,
+    };
+    unsafe {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lower_worker_priority() {}
+
 fn spawn_worker(
     samples: Vec<f32>,
     rate: u32,
@@ -302,6 +317,7 @@ fn spawn_worker(
     tx: Sender<WorkResult>,
 ) {
     std::thread::spawn(move || {
+        lower_worker_priority();
         // Always deliver a result so `busy` is never left stuck by a panic.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             process_utterance(
