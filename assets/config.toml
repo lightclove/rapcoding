@@ -32,4 +32,4 @@ settle_ms = 300            # wait after paste before restoring the clipboard
 
 [gui]
 enabled = true             # false = console-only mode (no window)
-theme = "dark"             # "dark" | "light"
+theme = "light"            # "light" | "dark"

@@ -23,6 +23,9 @@ pub enum Error {
 
     #[error("inject: {0}")]
     Inject(String),
+
+    #[error("gui: {0}")]
+    Gui(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -6,10 +6,15 @@ rust-version = "1.85"
 description = "Low-latency push-to-talk voice input for code and prompts (local Vosk ASR)"
 license = "MIT"
 
+[features]
+default = []
+gui = ["dep:eframe"]
+
 [dependencies]
 arboard = { version = "3.7", default-features = false }
 cpal = "0.18"
 crossbeam-channel = "0.5"
+eframe = { version = "0.32", optional = true }
 enigo = "0.6"
 global-hotkey = "0.9"
 serde = { version = "1", features = ["derive"] }

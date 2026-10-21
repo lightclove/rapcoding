@@ -146,7 +146,7 @@ impl Default for Gui {
     fn default() -> Self {
         Gui {
             enabled: true,
-            theme: "dark".into(),
+            theme: "light".into(),
         }
     }
 }
@@ -277,6 +277,13 @@ pub fn load(path: &Path) -> Result<Config> {
     }
 }
 
+/// Serialize a config back to TOML (used by the GUI to persist edits).
+pub fn save(path: &Path, cfg: &Config) -> Result<()> {
+    let s = toml::to_string_pretty(cfg)?;
+    std::fs::write(path, s)?;
+    Ok(())
+}
+
 /// Resolve a relative path (e.g. the model) against config dir, cwd, then exe dir.
 pub fn resolve_model_path(cfg_dir: &Path, rel: &str) -> PathBuf {
     let p = Path::new(rel);
@@ -401,5 +408,23 @@ mod tests {
         let mut c = Config::default();
         c.gui.enabled = false;
         c.validate().expect("disabled gui must be valid");
+    }
+
+    #[test]
+    fn gui_theme_defaults_to_light() {
+        assert_eq!(Config::default().gui.theme, "light");
+    }
+
+    #[test]
+    fn save_load_roundtrip() {
+        let cfg = Config::default();
+        let path = std::env::temp_dir().join(format!(
+            "rapcoding-config-roundtrip-{}.toml",
+            std::process::id()
+        ));
+        save(&path, &cfg).expect("save must succeed");
+        let loaded = load(&path).expect("load must succeed");
+        assert_eq!(loaded, cfg);
+        let _ = std::fs::remove_file(&path);
     }
 }

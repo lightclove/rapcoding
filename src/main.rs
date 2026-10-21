@@ -2,6 +2,8 @@ mod asr;
 mod audio;
 mod config;
 mod error;
+#[cfg(feature = "gui")]
+mod gui;
 mod hotkey;
 mod inject;
 mod log;
@@ -40,6 +42,8 @@ fn main() {
 fn run(args: Vec<String>) -> Result<i32> {
     let mut config_override: Option<PathBuf> = None;
     let mut verbose = false;
+    let mut gui_flag = false;
+    let mut no_gui = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut it = args.into_iter();
@@ -52,6 +56,8 @@ fn run(args: Vec<String>) -> Result<i32> {
                 config_override = Some(PathBuf::from(p));
             }
             "--verbose" | "-v" => verbose = true,
+            "--gui" => gui_flag = true,
+            "--no-gui" => no_gui = true,
             "--help" | "-h" => {
                 print_help();
                 return Ok(0);
@@ -67,7 +73,28 @@ fn run(args: Vec<String>) -> Result<i32> {
 
     let cmd = positional.first().map(|s| s.as_str()).unwrap_or("run");
     match cmd {
-        "run" => cmd_run(config_override.as_deref(), verbose),
+        "run" => {
+            if gui_flag && no_gui {
+                return Err(Error::Config(
+                    "--gui and --no-gui are mutually exclusive".into(),
+                ));
+            }
+            #[cfg(feature = "gui")]
+            {
+                if gui_flag {
+                    return cmd_gui(config_override.as_deref(), verbose);
+                }
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                if gui_flag {
+                    return Err(Error::Config(
+                        "GUI support not compiled (rebuild with --features gui)".into(),
+                    ));
+                }
+            }
+            cmd_run(config_override.as_deref(), verbose)
+        }
         "check" => cmd_check(config_override.as_deref()),
         "devices" => cmd_devices(),
         "init" => cmd_init(config_override.as_deref()),
@@ -287,6 +314,13 @@ fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
 
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(feature = "gui")]
+fn cmd_gui(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
+    let path = config::config_path(override_path);
+    let cfg = config::load(&path)?;
+    gui::run(cfg, path, verbose)
 }
 
 /// Run CPU-heavy transcription at below-normal priority so the real-time
@@ -651,6 +685,8 @@ COMMANDS:
 
 OPTIONS:
   --config <path>  Use a specific config file
+  --gui            Open the GUI window (requires --features gui)
+  --no-gui         Run headless even if gui.enabled = true
   -v, --verbose    Debug logging
   -V, --version    Print version
   -h, --help       Show this help
