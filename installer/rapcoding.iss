@@ -1,7 +1,7 @@
 ; rapcoding installer (per-user, no admin required).
-; Build from the repo root: ISCC.exe installer\rapcoding.iss
-;   [PreCompile] runs installer\build.ps1, which builds both the console and
-;   GUI binaries into target\release\ (needs Rust + cargo in PATH).
+; Build from the repo root (needs Rust + cargo in PATH):
+;   1. powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1
+;   2. ISCC.exe installer\rapcoding.iss
 ; Output: dist\RapcodingSetup-0.1.0.exe
 
 #define MyAppName "rapcoding"
@@ -76,13 +76,8 @@ Filename: "powershell.exe"; \
     Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\pin-taskbar.ps1"" -Target ""{app}\{#MyAppExeName}"""; \
     Tasks: taskbar; Flags: runhidden
 
-[PreCompile]
-Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""installer\build.ps1"""; \
-    StatusMsg: "Сборка rapcoding (консоль + GUI)…"; Flags: abortonerror
-
 [Code]
-function AnyModelSelected(Param: string): Boolean;
+function AnyModelSelected: Boolean;
 begin
   Result := IsComponentSelected('ru_light') or IsComponentSelected('ru_heavy')
          or IsComponentSelected('en_light') or IsComponentSelected('en_heavy');

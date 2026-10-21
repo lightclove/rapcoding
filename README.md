@@ -112,13 +112,15 @@
 ### Установщик (Windows)
 
 Есть готовый установщик — `installer/rapcoding.iss` (Inno Setup). Ставит в
-`%LOCALAPPDATA%\Programs\rapcoding`, без прав администратора. Перед упаковкой
-он сам собирает обе версии (консольную и GUI) скриптом `installer/build.ps1`
-(шаг `[PreCompile]`) — нужен Rust + cargo в PATH.
+`%LOCALAPPDATA%\Programs\rapcoding`, без прав администратора. Сборка в два
+шага (нужен Rust + cargo и Inno Setup):
 
 ```
-ISCC.exe installer/rapcoding.iss
+powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1
+ISCC.exe installer\rapcoding.iss
 ```
+
+`build.ps1` собирает обе версии (консольную и GUI) в `target\release\`.
 
 Результат: `dist/RapcodingSetup-0.1.0.exe`. В установщике выбирается:
 
