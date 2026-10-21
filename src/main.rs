@@ -189,28 +189,39 @@ fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
     let status = Arc::new(Mutex::new(Status::Idle));
     let live = LiveLog::new(500);
     let journal = Journal::new(config::config_dir().join("journal.log"));
-    let daemon = Daemon::start(
+    // The window must open even when the daemon cannot start (missing model,
+    // no microphone, hotkey conflict): the user needs the UI to fix it, and an
+    // invisible failure would look like the app simply does nothing.
+    match Daemon::start(
         cfg.clone(),
         &path,
         verbose,
         status.clone(),
         Some(live.clone()),
         &journal,
-    )?;
-    std::thread::Builder::new()
-        .name("rapcoding-daemon".into())
-        .spawn(move || {
-            if let Err(e) = daemon.run() {
-                log::write_line(
-                    &mut std::io::stderr(),
-                    &format!(
-                        "rapcoding daemon stopped: {}",
-                        log::sanitize(&e.to_string())
-                    ),
-                );
-            }
-        })
-        .map_err(|e| Error::Gui(format!("daemon thread: {e}")))?;
+    ) {
+        Ok(daemon) => {
+            std::thread::Builder::new()
+                .name("rapcoding-daemon".into())
+                .spawn(move || {
+                    if let Err(e) = daemon.run() {
+                        log::write_line(
+                            &mut std::io::stderr(),
+                            &format!(
+                                "rapcoding daemon stopped: {}",
+                                log::sanitize(&e.to_string())
+                            ),
+                        );
+                    }
+                })
+                .map_err(|e| Error::Gui(format!("daemon thread: {e}")))?;
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            *sync::lock_recover(&status) = Status::Error(msg.clone());
+            journal.append("session", &format!("daemon failed: {msg}"));
+        }
+    }
     gui::run(cfg, path, status, live, journal, verbose)
 }
 

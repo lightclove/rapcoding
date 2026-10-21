@@ -218,7 +218,8 @@ pub fn run(
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([720.0, 480.0])
+            .with_min_inner_size([460.0, 340.0])
+            .with_resizable(true)
             .with_title("rapcoding"),
         ..Default::default()
     };
@@ -262,14 +263,15 @@ impl eframe::App for GuiApp {
             self.theme.style(ctx);
         }
         let p = self.theme.palette();
+        let compact = ctx.screen_rect().width() < 900.0;
         let busy = sync::lock_recover(&self.dl_state).is_busy();
         if busy {
             // Repaint while downloading so the progress bar stays live.
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
-        self.header(ctx, p);
-        self.nav(ctx, p);
+        self.header(ctx, p, compact);
+        self.nav(ctx, p, compact);
 
         egui::CentralPanel::default()
             .frame(
@@ -293,7 +295,7 @@ impl eframe::App for GuiApp {
 impl GuiApp {
     // ------------------------------------------------------------- chrome
 
-    fn header(&mut self, ctx: &egui::Context, p: Palette) {
+    fn header(&mut self, ctx: &egui::Context, p: Palette, compact: bool) {
         egui::TopBottomPanel::top("header")
             .exact_height(64.0)
             .frame(
@@ -305,11 +307,13 @@ impl GuiApp {
             .show(ctx, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.label(RichText::new("rapcoding").size(20.0).strong().color(p.text));
-                    ui.label(
-                        RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .size(12.0)
-                            .color(p.muted),
-                    );
+                    if !compact {
+                        ui.label(
+                            RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(12.0)
+                                .color(p.muted),
+                        );
+                    }
                     ui.add_space(12.0);
                     self.status_pill(ui, p);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -317,16 +321,20 @@ impl GuiApp {
                             Theme::Light => ("🌙", "Тёмная тема"),
                             Theme::Dark => ("☀", "Светлая тема"),
                         };
-                        if ui.button(format!("{icon}  {label}")).clicked() {
+                        let text = if compact {
+                            icon.to_string()
+                        } else {
+                            format!("{icon}  {label}")
+                        };
+                        if ui.button(text).clicked() {
                             self.theme = self.theme.toggle();
                             self.cfg.gui.theme = self.theme.as_str().to_string();
                             self.journal
                                 .append("config", &format!("theme -> {}", self.theme.as_str()));
-                            self.persist_error =
-                                match config::save(&self.config_path, &self.cfg) {
-                                    Ok(()) => None,
-                                    Err(e) => Some(e.to_string()),
-                                };
+                            self.persist_error = match config::save(&self.config_path, &self.cfg) {
+                                Ok(()) => None,
+                                Err(e) => Some(e.to_string()),
+                            };
                         }
                     });
                 });
@@ -356,14 +364,15 @@ impl GuiApp {
         }
     }
 
-    fn nav(&mut self, ctx: &egui::Context, p: Palette) {
+    fn nav(&mut self, ctx: &egui::Context, p: Palette, compact: bool) {
+        let width = if compact { 68.0 } else { 180.0 };
         egui::SidePanel::left("nav")
-            .exact_width(180.0)
+            .exact_width(width)
             .resizable(false)
             .frame(
                 egui::Frame::new()
                     .fill(p.surface)
-                    .inner_margin(Margin::symmetric(10, 16))
+                    .inner_margin(Margin::symmetric(if compact { 8 } else { 10 }, 16))
                     .stroke(Stroke::new(1.0_f32, p.stroke)),
             )
             .show(ctx, |ui| {
@@ -377,20 +386,29 @@ impl GuiApp {
                     let resp = egui::Frame::new()
                         .fill(fill)
                         .corner_radius(CornerRadius::same(9))
-                        .inner_margin(Margin::symmetric(12, 9))
+                        .inner_margin(Margin::symmetric(if compact { 6 } else { 12 }, 9))
                         .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(RichText::new(page.icon()).size(14.0).color(color));
-                                ui.label(
-                                    RichText::new(page.title())
-                                        .size(14.0)
-                                        .color(color)
-                                        .strong(),
-                                );
-                            });
+                            if compact {
+                                ui.vertical_centered(|ui| {
+                                    ui.label(RichText::new(page.icon()).size(16.0).color(color));
+                                });
+                            } else {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(page.icon()).size(14.0).color(color));
+                                    ui.label(
+                                        RichText::new(page.title())
+                                            .size(14.0)
+                                            .color(color)
+                                            .strong(),
+                                    );
+                                });
+                            }
                         })
                         .response;
                     let resp = resp.interact(egui::Sense::click());
+                    if compact {
+                        resp.clone().on_hover_text(page.title());
+                    }
                     if resp.clicked() {
                         self.page = page;
                     }
@@ -398,23 +416,25 @@ impl GuiApp {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
                 }
-                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    if !self.cfg.gui.enabled {
+                if !compact {
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                        if !self.cfg.gui.enabled {
+                            ui.label(
+                                RichText::new("консольный режим")
+                                    .size(11.0)
+                                    .color(p.muted),
+                            );
+                        }
                         ui.label(
-                            RichText::new("консольный режим")
-                                .size(11.0)
-                                .color(p.muted),
+                            RichText::new(match self.cfg.general.mode.as_str() {
+                                "toggle" => "режим: toggle",
+                                _ => "режим: hold",
+                            })
+                            .size(11.0)
+                            .color(p.muted),
                         );
-                    }
-                    ui.label(
-                        RichText::new(match self.cfg.general.mode.as_str() {
-                            "toggle" => "режим: toggle",
-                            _ => "режим: hold",
-                        })
-                        .size(11.0)
-                        .color(p.muted),
-                    );
-                });
+                    });
+                }
             });
     }
 
@@ -470,21 +490,58 @@ impl GuiApp {
         });
 
         ui.add_space(12.0);
-        ui.columns(2, |cols| {
-            Self::card(&mut cols[0], p, |ui| {
-                Self::section_title(ui, p, "МОДЕЛИ");
-                ui.add_space(6.0);
-                model_line(ui, p, "RU", &self.cfg.asr.model);
-                ui.add_space(6.0);
-                model_line(ui, p, "EN", &self.cfg.asr.en_model);
+        if ui.available_width() >= 720.0 {
+            ui.columns(2, |cols| {
+                self.models_card(&mut cols[0], p);
+                self.mode_card(&mut cols[1], p);
             });
-            Self::card(&mut cols[1], p, |ui| {
-                Self::section_title(ui, p, "ВСТАВКА И РЕЖИМ");
-                ui.add_space(6.0);
-                kv(ui, p, "Метод", if self.cfg.inject.method == "type" { "печать" } else { "буфер обмена" });
-                kv(ui, p, "Режим", if self.cfg.general.mode == "toggle" { "toggle" } else { "hold" });
-                kv(ui, p, "Вставка включена", if self.cfg.inject.enabled { "да" } else { "нет" });
-            });
+        } else {
+            self.models_card(ui, p);
+            ui.add_space(12.0);
+            self.mode_card(ui, p);
+        }
+    }
+
+    fn models_card(&self, ui: &mut egui::Ui, p: Palette) {
+        Self::card(ui, p, |ui| {
+            Self::section_title(ui, p, "МОДЕЛИ");
+            ui.add_space(6.0);
+            model_line(ui, p, "RU", &self.cfg.asr.model);
+            ui.add_space(6.0);
+            model_line(ui, p, "EN", &self.cfg.asr.en_model);
+        });
+    }
+
+    fn mode_card(&self, ui: &mut egui::Ui, p: Palette) {
+        Self::card(ui, p, |ui| {
+            Self::section_title(ui, p, "ВСТАВКА И РЕЖИМ");
+            ui.add_space(6.0);
+            kv(
+                ui,
+                p,
+                "Метод",
+                if self.cfg.inject.method == "type" {
+                    "печать"
+                } else {
+                    "буфер обмена"
+                },
+            );
+            kv(
+                ui,
+                p,
+                "Режим",
+                if self.cfg.general.mode == "toggle" {
+                    "toggle"
+                } else {
+                    "hold"
+                },
+            );
+            kv(
+                ui,
+                p,
+                "Вставка включена",
+                if self.cfg.inject.enabled { "да" } else { "нет" },
+            );
         });
     }
 
@@ -523,7 +580,7 @@ impl GuiApp {
             };
 
             Self::card(ui, p, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label(RichText::new(m.name).monospace().size(14.0).color(p.text));
                     ui.add_space(6.0);
                     badge(ui, if m.lang == "ru" { "RU" } else { "EN" }, p.accent);
@@ -532,17 +589,15 @@ impl GuiApp {
                             .size(12.0)
                             .color(p.muted),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if active {
-                            badge(ui, "активна", p.success);
-                        } else if installed {
-                            badge(ui, "установлена", p.muted);
-                        }
-                    });
+                    if active {
+                        badge(ui, "активна", p.success);
+                    } else if installed {
+                        badge(ui, "установлена", p.muted);
+                    }
                 });
 
                 ui.add_space(10.0);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if is_current && busy {
                         if ui.button("Стоп").clicked() {
                             if let Some(flag) = &self.dl_cancel {
