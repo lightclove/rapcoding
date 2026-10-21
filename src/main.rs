@@ -7,6 +7,7 @@ mod gui;
 mod hotkey;
 mod inject;
 mod log;
+mod status;
 mod sync;
 mod text;
 mod wav;
@@ -17,8 +18,10 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use config::Config;
 use error::{Error, Result};
 use log::{Level, Logger};
+use status::Status;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -79,10 +82,12 @@ fn run(args: Vec<String>) -> Result<i32> {
                     "--gui and --no-gui are mutually exclusive".into(),
                 ));
             }
+            let path = config::config_path(config_override.as_deref());
+            let cfg = config::load(&path)?;
             #[cfg(feature = "gui")]
             {
-                if gui_flag {
-                    return cmd_gui(config_override.as_deref(), verbose);
+                if !no_gui && (gui_flag || cfg.gui.enabled) {
+                    return cmd_gui(cfg, path, verbose);
                 }
             }
             #[cfg(not(feature = "gui"))]
@@ -93,7 +98,7 @@ fn run(args: Vec<String>) -> Result<i32> {
                     ));
                 }
             }
-            cmd_run(config_override.as_deref(), verbose)
+            cmd_run(cfg, path, verbose)
         }
         "check" => cmd_check(config_override.as_deref()),
         "devices" => cmd_devices(),
@@ -168,159 +173,226 @@ struct WorkResult {
     message: String,
 }
 
-fn cmd_run(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
-    let path = config::config_path(override_path);
-    let cfg = config::load(&path)?;
-    let level = if verbose { Level::Debug } else { Level::Info };
-    let log_path = config::config_dir().join("rapcoding.log");
-    let logger = Logger::new(log_path, level, cfg.general.log_transcripts)?;
-    logger.info(&format!(
-        "rapcoding {VERSION} starting; config {}",
-        path.display()
-    ));
-
-    let mode = parse_mode(&cfg.general.mode)?;
-    let audio = audio::AudioCapture::new(&cfg.audio.device)?;
-    logger.info(&format!(
-        "audio device '{}' {} Hz {} ch",
-        audio.device_name(),
-        audio.device_rate(),
-        audio.channels()
-    ));
-
-    let base_dir = config_dir_of(&path);
-    let model_dir = config::resolve_model_path(&base_dir, &cfg.asr.model);
-    let en_model_dir = config::resolve_model_path(&base_dir, &cfg.asr.en_model);
-    let asr = asr::VoskAsr::new(&model_dir)?;
-    if let Err(e) = asr.check() {
-        logger.warn(&format!("asr not ready: {e} (recognition will fail)"));
-    }
-    logger.debug(&format!(
-        "asr: model={} en_model={}",
-        cfg.asr.model, cfg.asr.en_model
-    ));
-    let injector = inject::Injector::new(
-        cfg.inject.enabled,
-        &cfg.inject.method,
-        &cfg.inject.paste_shortcut,
-        cfg.inject.restore_clipboard,
-        cfg.inject.settle_ms,
-    )?;
-
-    let (hot_tx, hot_rx) = mpsc::channel::<hotkey::HotMsg>();
-    let bindings = vec![cfg.general.hotkey.clone(), cfg.general.en_hotkey.clone()];
-    let _hk = hotkey::spawn_hotkeys(&bindings, hot_tx)?;
-    for b in &bindings {
-        logger.info(&format!(
-            "hotkey '{b}' registered (mode {})",
-            cfg.general.mode
-        ));
-    }
-
-    let (work_tx, work_rx) = mpsc::channel::<WorkResult>();
-    let busy = Arc::new(AtomicBool::new(false));
-    // English model loads lazily on first EN utterance to save RAM.
-    let en = Arc::new(Mutex::new(None::<asr::VoskAsr>));
-    let max = Duration::from_secs(cfg.general.max_record_secs.max(1));
-    let mut recording: Option<usize> = None;
-
-    let dispatch = |samples: Vec<f32>, lang: Lang| {
-        if samples.is_empty() {
-            return;
-        }
-        busy.store(true, Ordering::Relaxed);
-        logger.info(&format!("transcribing… ({})", lang.name()));
-        spawn_worker(
-            samples,
-            audio.device_rate(),
-            lang,
-            cfg.clone(),
-            asr.clone(),
-            en.clone(),
-            en_model_dir.clone(),
-            injector.clone(),
-            logger.clone(),
-            work_tx.clone(),
-        );
-    };
-
-    loop {
-        // Hotkey events.
-        let mut fatal: Option<String> = None;
-        while let Ok(msg) = hot_rx.try_recv() {
-            match msg {
-                hotkey::HotMsg::Fatal(e) => {
-                    fatal = Some(e);
-                    break;
-                }
-                hotkey::HotMsg::Event { id, state } => match (mode, state) {
-                    (Mode::Hold, hotkey::HotEvent::Pressed) => {
-                        if busy.load(Ordering::Relaxed) {
-                            logger.warn("busy: ignoring hotkey");
-                        } else if recording.is_none() {
-                            audio.start();
-                            recording = Some(id);
-                            logger.info(&format!("listening ({})", Lang::of(id).name()));
-                        }
-                    }
-                    (Mode::Hold, hotkey::HotEvent::Released) => {
-                        if recording == Some(id) {
-                            recording = None;
-                            dispatch(audio.stop(), Lang::of(id));
-                        }
-                    }
-                    (Mode::Toggle, hotkey::HotEvent::Pressed) => {
-                        if let Some(start_id) = recording.take() {
-                            dispatch(audio.stop(), Lang::of(start_id));
-                        } else if busy.load(Ordering::Relaxed) {
-                            logger.warn("busy: ignoring hotkey");
-                        } else {
-                            audio.start();
-                            recording = Some(id);
-                            logger.info(&format!("listening ({})", Lang::of(id).name()));
-                        }
-                    }
-                    (_, hotkey::HotEvent::Released) => {}
-                },
-            }
-        }
-        if let Some(e) = fatal {
-            return Err(Error::Hotkey(e));
-        }
-
-        // Worker results.
-        while let Ok(r) = work_rx.try_recv() {
-            if r.ok {
-                logger.info(&format!(
-                    "recognized {} chars; asr {:?}; inject {:?} ({})",
-                    r.text_len, r.asr_ms, r.inject_ms, r.message
-                ));
-            } else {
-                logger.warn(&r.message);
-            }
-            busy.store(false, Ordering::Relaxed);
-        }
-
-        // Auto-stop runaway recordings.
-        if let Some(start_id) = recording {
-            if let Some(el) = audio.elapsed() {
-                if el >= max {
-                    recording = None;
-                    logger.info("auto-stop at max duration");
-                    dispatch(audio.stop(), Lang::of(start_id));
-                }
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(10));
-    }
+fn cmd_run(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
+    let status = Arc::new(Mutex::new(Status::Idle));
+    let daemon = Daemon::start(cfg, &path, verbose, status)?;
+    daemon.run()
 }
 
 #[cfg(feature = "gui")]
-fn cmd_gui(override_path: Option<&Path>, verbose: bool) -> Result<i32> {
-    let path = config::config_path(override_path);
-    let cfg = config::load(&path)?;
-    gui::run(cfg, path, verbose)
+fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
+    let status = Arc::new(Mutex::new(Status::Idle));
+    let daemon = Daemon::start(cfg.clone(), &path, verbose, status.clone())?;
+    std::thread::Builder::new()
+        .name("rapcoding-daemon".into())
+        .spawn(move || {
+            if let Err(e) = daemon.run() {
+                log::write_line(
+                    &mut std::io::stderr(),
+                    &format!(
+                        "rapcoding daemon stopped: {}",
+                        log::sanitize(&e.to_string())
+                    ),
+                );
+            }
+        })
+        .map_err(|e| Error::Gui(format!("daemon thread: {e}")))?;
+    gui::run(cfg, path, status, verbose)
+}
+
+/// Everything the recognition loop needs. Setup runs synchronously so early
+/// failures (bad config, missing audio/model, hotkey conflict) surface to the
+/// caller instead of dying silently on a background thread.
+struct Daemon {
+    cfg: Config,
+    mode: Mode,
+    logger: Logger,
+    audio: audio::AudioCapture,
+    asr: asr::VoskAsr,
+    en_model_dir: PathBuf,
+    injector: inject::Injector,
+    hot_rx: mpsc::Receiver<hotkey::HotMsg>,
+    _hotkeys: std::thread::JoinHandle<()>,
+    work_tx: mpsc::Sender<WorkResult>,
+    work_rx: mpsc::Receiver<WorkResult>,
+    busy: Arc<AtomicBool>,
+    en: Arc<Mutex<Option<asr::VoskAsr>>>,
+    max: Duration,
+    status: Arc<Mutex<Status>>,
+}
+
+impl Daemon {
+    fn start(
+        cfg: Config,
+        path: &Path,
+        verbose: bool,
+        status: Arc<Mutex<Status>>,
+    ) -> Result<Self> {
+        let level = if verbose { Level::Debug } else { Level::Info };
+        let log_path = config::config_dir().join("rapcoding.log");
+        let logger = Logger::new(log_path, level, cfg.general.log_transcripts)?;
+        logger.info(&format!("rapcoding {VERSION} starting; config {}", path.display()));
+
+        let mode = parse_mode(&cfg.general.mode)?;
+        let audio = audio::AudioCapture::new(&cfg.audio.device)?;
+        logger.info(&format!(
+            "audio device '{}' {} Hz {} ch",
+            audio.device_name(),
+            audio.device_rate(),
+            audio.channels()
+        ));
+
+        let base_dir = config_dir_of(path);
+        let model_dir = config::resolve_model_path(&base_dir, &cfg.asr.model);
+        let en_model_dir = config::resolve_model_path(&base_dir, &cfg.asr.en_model);
+        let asr = asr::VoskAsr::new(&model_dir)?;
+        if let Err(e) = asr.check() {
+            logger.warn(&format!("asr not ready: {e} (recognition will fail)"));
+        }
+        logger.debug(&format!("asr: model={} en_model={}", cfg.asr.model, cfg.asr.en_model));
+        let injector = inject::Injector::new(
+            cfg.inject.enabled,
+            &cfg.inject.method,
+            &cfg.inject.paste_shortcut,
+            cfg.inject.restore_clipboard,
+            cfg.inject.settle_ms,
+        )?;
+
+        let (hot_tx, hot_rx) = mpsc::channel::<hotkey::HotMsg>();
+        let bindings = vec![cfg.general.hotkey.clone(), cfg.general.en_hotkey.clone()];
+        let hotkeys = hotkey::spawn_hotkeys(&bindings, hot_tx)?;
+        for b in &bindings {
+            logger.info(&format!("hotkey '{b}' registered (mode {})", cfg.general.mode));
+        }
+
+        let (work_tx, work_rx) = mpsc::channel::<WorkResult>();
+        let max = Duration::from_secs(cfg.general.max_record_secs.max(1));
+        Ok(Daemon {
+            cfg,
+            mode,
+            logger,
+            audio,
+            asr,
+            en_model_dir,
+            injector,
+            hot_rx,
+            _hotkeys: hotkeys,
+            work_tx,
+            work_rx,
+            busy: Arc::new(AtomicBool::new(false)),
+            en: Arc::new(Mutex::new(None::<asr::VoskAsr>)),
+            max,
+            status,
+        })
+    }
+
+    fn set_status(&self, s: Status) {
+        *sync::lock_recover(&self.status) = s;
+    }
+
+    fn dispatch(&self, samples: Vec<f32>, lang: Lang) {
+        if samples.is_empty() {
+            return;
+        }
+        self.busy.store(true, Ordering::Relaxed);
+        self.set_status(Status::Transcribing(lang.name()));
+        self.logger.info(&format!("transcribing… ({})", lang.name()));
+        spawn_worker(
+            samples,
+            self.audio.device_rate(),
+            lang,
+            self.cfg.clone(),
+            self.asr.clone(),
+            self.en.clone(),
+            self.en_model_dir.clone(),
+            self.injector.clone(),
+            self.logger.clone(),
+            self.work_tx.clone(),
+        );
+    }
+
+    fn run(self) -> Result<i32> {
+        let mut recording: Option<usize> = None;
+
+        loop {
+            // Hotkey events.
+            let mut fatal: Option<String> = None;
+            while let Ok(msg) = self.hot_rx.try_recv() {
+                match msg {
+                    hotkey::HotMsg::Fatal(e) => {
+                        fatal = Some(e);
+                        break;
+                    }
+                    hotkey::HotMsg::Event { id, state } => match (self.mode, state) {
+                        (Mode::Hold, hotkey::HotEvent::Pressed) => {
+                            if self.busy.load(Ordering::Relaxed) {
+                                self.logger.warn("busy: ignoring hotkey");
+                            } else if recording.is_none() {
+                                self.audio.start();
+                                recording = Some(id);
+                                self.set_status(Status::Listening(Lang::of(id).name()));
+                                self.logger.info(&format!("listening ({})", Lang::of(id).name()));
+                            }
+                        }
+                        (Mode::Hold, hotkey::HotEvent::Released) => {
+                            if recording == Some(id) {
+                                recording = None;
+                                let samples = self.audio.stop();
+                                self.dispatch(samples, Lang::of(id));
+                            }
+                        }
+                        (Mode::Toggle, hotkey::HotEvent::Pressed) => {
+                            if let Some(start_id) = recording.take() {
+                                let samples = self.audio.stop();
+                                self.dispatch(samples, Lang::of(start_id));
+                            } else if self.busy.load(Ordering::Relaxed) {
+                                self.logger.warn("busy: ignoring hotkey");
+                            } else {
+                                self.audio.start();
+                                recording = Some(id);
+                                self.set_status(Status::Listening(Lang::of(id).name()));
+                                self.logger.info(&format!("listening ({})", Lang::of(id).name()));
+                            }
+                        }
+                        (_, hotkey::HotEvent::Released) => {}
+                    },
+                }
+            }
+            if let Some(e) = fatal {
+                self.logger.warn(&format!("fatal: {e}"));
+                self.set_status(Status::Error(e.clone()));
+                return Err(Error::Hotkey(e));
+            }
+
+            // Worker results.
+            while let Ok(r) = self.work_rx.try_recv() {
+                if r.ok {
+                    self.logger.info(&format!(
+                        "recognized {} chars; asr {:?}; inject {:?} ({})",
+                        r.text_len, r.asr_ms, r.inject_ms, r.message
+                    ));
+                } else {
+                    self.logger.warn(&r.message);
+                }
+                self.busy.store(false, Ordering::Relaxed);
+                self.set_status(Status::Idle);
+            }
+
+            // Auto-stop runaway recordings.
+            if let Some(start_id) = recording {
+                if let Some(el) = self.audio.elapsed() {
+                    if el >= self.max {
+                        recording = None;
+                        self.logger.info("auto-stop at max duration");
+                        let samples = self.audio.stop();
+                        self.dispatch(samples, Lang::of(start_id));
+                    }
+                }
+            }
+
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 /// Run CPU-heavy transcription at below-normal priority so the real-time
