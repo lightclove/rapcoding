@@ -235,6 +235,11 @@ impl GuiApp {
 
                 for m in download::MODELS {
                     let installed = download::model_dir(&root, m.name).exists();
+                    let active = if m.lang == "ru" {
+                        self.cfg.asr.model == m.config_value()
+                    } else {
+                        self.cfg.asr.en_model == m.config_value()
+                    };
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "{} ({} · {})",
@@ -243,7 +248,17 @@ impl GuiApp {
                             download::human_size(m.size_bytes)
                         ));
                         if installed {
-                            ui.label("✓ установлена");
+                            if active {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(0x2e, 0xcc, 0x71),
+                                    "✓ активна",
+                                );
+                            } else if ui
+                                .button(format!("Сделать активной ({})", m.lang.to_uppercase()))
+                                .clicked()
+                            {
+                                self.activate_model(m);
+                            }
                         } else if ui
                             .add_enabled(!busy, egui::Button::new("Скачать"))
                             .clicked()
@@ -252,6 +267,7 @@ impl GuiApp {
                         }
                     });
                 }
+                ui.small("Активная модель применяется после перезапуска rapcoding.");
 
                 ui.separator();
                 match &state {
@@ -330,6 +346,21 @@ impl GuiApp {
                 Err(e) => set(DlState::Error(e.to_string())),
             }
         });
+    }
+
+    fn activate_model(&mut self, m: &'static download::Model) {
+        let value = m.config_value();
+        if m.lang == "ru" {
+            self.cfg.asr.model = value;
+        } else {
+            self.cfg.asr.en_model = value;
+        }
+        self.journal
+            .append("config", &format!("activate model {} ({})", m.name, m.lang));
+        self.persist_error = match config::save(&self.config_path, &self.cfg) {
+            Ok(()) => None,
+            Err(e) => Some(e.to_string()),
+        };
     }
 
     fn log_section(&mut self, ui: &mut egui::Ui) {

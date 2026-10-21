@@ -16,6 +16,14 @@ pub struct Model {
     pub size_bytes: u64,
 }
 
+impl Model {
+    /// `asr.model` / `asr.en_model` value pointing at this model's directory.
+    /// Models live in `<config_dir>/models/`, resolved by `resolve_model_path`.
+    pub fn config_value(&self) -> String {
+        format!("models/{}", self.name)
+    }
+}
+
 /// Catalog of heavier models (URLs/sizes verified in SC-gui).
 pub const MODELS: &[Model] = &[
     Model {
@@ -157,6 +165,11 @@ mod tests {
             model_dir(Path::new("/m/root"), "vosk-model-ru-0.42"),
             PathBuf::from("/m/root/vosk-model-ru-0.42")
         );
+    }
+
+    #[test]
+    fn config_value_is_models_prefix() {
+        assert_eq!(MODELS[0].config_value(), "models/vosk-model-ru-0.42");
     }
 
     #[test]
