@@ -4,6 +4,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -75,21 +76,31 @@ pub fn human_size(bytes: u64) -> String {
 }
 
 /// Stream `url` into `dest`, calling `progress(downloaded, total)` as bytes
-/// arrive. On any failure the partial `dest` is removed.
-pub fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
-    let result = download_inner(url, dest, progress);
+/// arrive. On any failure or cancellation the partial `dest` is removed.
+pub fn download(
+    url: &str,
+    dest: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let result = download_inner(url, dest, progress, cancel);
     if result.is_err() {
         let _ = fs::remove_file(dest);
     }
     result
 }
 
-fn download_inner(url: &str, dest: &Path, progress: &mut dyn FnMut(u64, u64)) -> Result<()> {
+fn download_inner(
+    url: &str,
+    dest: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<()> {
     // Per-read timeout: a stalled connection (server sends nothing) must fail
     // loudly instead of blocking the download thread forever.
     let agent = ureq::builder()
         .timeout_connect(Duration::from_secs(20))
-        .timeout_read(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(15))
         .build();
     let resp = agent
         .get(url)
@@ -110,6 +121,9 @@ fn download_inner(url: &str, dest: &Path, progress: &mut dyn FnMut(u64, u64)) ->
     let mut buf = [0u8; 64 * 1024];
     let mut done: u64 = 0;
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Error::Download("скачивание отменено".into()));
+        }
         let n = reader
             .read(&mut buf)
             .map_err(|e| Error::Download(format!("read (stalled?): {e}")))?;
