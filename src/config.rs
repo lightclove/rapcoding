@@ -31,6 +31,11 @@ pub struct General {
 #[serde(default, deny_unknown_fields)]
 pub struct Audio {
     pub device: String,
+    /// Deprecated: the ASR rate is fixed at 16 kHz (`asr::ASR_RATE`). Kept as a
+    /// known-but-ignored field so configs written before 0.1.0 (which carried
+    /// `sample_rate`) still parse instead of failing `deny_unknown_fields`.
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
     pub silence_threshold: f32,
     pub silence_padding_ms: u32,
     pub min_speech_ms: u32,
@@ -89,6 +94,7 @@ impl Default for Audio {
     fn default() -> Self {
         Audio {
             device: String::new(),
+            sample_rate: None,
             silence_threshold: 0.008,
             silence_padding_ms: 200,
             min_speech_ms: 250,
@@ -337,5 +343,25 @@ mod tests {
         let mut c = Config::default();
         c.general.max_record_secs = 3601;
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_sample_rate_field_is_accepted() {
+        // Configs written before 0.1.0 carried `sample_rate`. It must still
+        // parse (not be rejected as an unknown field) so existing users do
+        // not get a startup crash after upgrading.
+        let s = "[audio]\nsample_rate = 16000\n";
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.audio.sample_rate, Some(16_000));
+    }
+
+    #[test]
+    fn legacy_sample_rate_value_is_ignored() {
+        // The field is deprecated (ASR is fixed at 16 kHz), so any value is
+        // accepted and ignored rather than failing validation.
+        let s = "[audio]\nsample_rate = 48000\n";
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert!(cfg.validate().is_ok());
     }
 }
