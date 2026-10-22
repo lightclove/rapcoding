@@ -1003,7 +1003,7 @@ impl GuiApp {
                     total: m.size_bytes,
                 });
                 let zip_tmp = root.join(format!("{name}.zip.part"));
-                let result = download::download(m.url, &zip_tmp, &mut |done, total| {
+                let result = download::download(m.archive_url(), &zip_tmp, &mut |done, total| {
                     set(DlState::Downloading {
                         name: name.clone(),
                         received: done,
@@ -1042,7 +1042,7 @@ impl GuiApp {
         let journal = self.journal.clone();
         let root = config::config_dir().join("models");
         let name = m.name.to_string();
-        let url = m.url;
+        let url = m.archive_url();
         let size = m.size_bytes;
         let cancel = self.new_cancel_flag();
         journal.append("download", &format!("start {name}"));

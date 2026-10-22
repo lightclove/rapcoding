@@ -14,7 +14,10 @@ use crate::error::{Error, Result};
 pub struct Model {
     pub name: &'static str,
     pub lang: &'static str,
+    /// Primary source (our own GitHub release: fast, not throttled).
     pub url: &'static str,
+    /// Upstream fallback, used only when the primary source fails.
+    pub fallback_url: &'static str,
     pub size_bytes: u64,
 }
 
@@ -24,33 +27,50 @@ impl Model {
     pub fn config_value(&self) -> String {
         format!("models/{}", self.name)
     }
+
+    /// URL of the zip archive for this model.
+    pub fn archive_url(&self) -> &'static str {
+        format!("{}/{}.zip", MIRROR_BASE, self.name)
+            .leak()
+    }
 }
 
-/// Catalog of heavier models (URLs/sizes verified in SC-gui).
+/// Our GitHub release that mirrors the model archives. GitHub serves these at
+/// several MB/s from networks where alphacephei.com is throttled to ~1 KB/s.
+const MIRROR_RELEASE: &str = "https://github.com/lightclove/rapcoding/releases/download/models-v1";
+
+/// Base URL for mirrored archives.
+pub const MIRROR_BASE: &str = MIRROR_RELEASE;
+
+/// Catalog of models (sizes = Content-Length from upstream).
 pub const MODELS: &[Model] = &[
+    Model {
+        name: "vosk-model-small-ru-0.22",
+        lang: "ru",
+        url: MIRROR_RELEASE,
+        fallback_url: "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
+        size_bytes: 46_236_750,
+    },
+    Model {
+        name: "vosk-model-small-en-us-0.15",
+        lang: "en",
+        url: MIRROR_RELEASE,
+        fallback_url: "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
+        size_bytes: 41_205_931,
+    },
     Model {
         name: "vosk-model-ru-0.42",
         lang: "ru",
-        url: "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip",
+        url: MIRROR_RELEASE,
+        fallback_url: "https://alphacephei.com/vosk/models/vosk-model-ru-0.42.zip",
         size_bytes: 1_937_602_113,
     },
     Model {
         name: "vosk-model-en-us-0.22",
         lang: "en",
-        url: "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
+        url: MIRROR_RELEASE,
+        fallback_url: "https://alphacephei.com/vosk/models/vosk-model-en-us-0.22.zip",
         size_bytes: 1_913_365_522,
-    },
-    Model {
-        name: "vosk-model-en-us-0.42-gigaspeech",
-        lang: "en",
-        url: "https://alphacephei.com/vosk/models/vosk-model-en-us-0.42-gigaspeech.zip",
-        size_bytes: 2_423_807_363,
-    },
-    Model {
-        name: "vosk-model-ru-0.10",
-        lang: "ru",
-        url: "https://alphacephei.com/vosk/models/vosk-model-ru-0.10.zip",
-        size_bytes: 2_672_443_065,
     },
 ];
 
@@ -72,6 +92,31 @@ pub fn human_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Download a model archive: primary URL first, then the upstream fallback.
+/// A failure of the primary source is not fatal — the fallback is tried, and
+/// only when both fail is the error reported (with both reasons).
+pub fn download_model(
+    m: &Model,
+    dest: &Path,
+    progress: &mut dyn FnMut(u64, u64),
+    cancel: &AtomicBool,
+) -> Result<()> {
+    let primary = download(m.archive_url(), dest, progress, cancel);
+    match primary {
+        Ok(()) => Ok(()),
+        Err(first) => {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(first);
+            }
+            download(m.fallback_url, dest, progress, cancel).map_err(|second| {
+                Error::Download(format!(
+                    "нет доступа ни к зеркалу, ни к сайту Vosk\nзеркало: {first}\nсайт: {second}"
+                ))
+            })
+        }
     }
 }
 
@@ -208,15 +253,20 @@ mod tests {
 
     #[test]
     fn config_value_is_models_prefix() {
-        assert_eq!(MODELS[0].config_value(), "models/vosk-model-ru-0.42");
+        assert_eq!(
+            MODELS[0].config_value(),
+            "models/vosk-model-small-ru-0.22"
+        );
     }
 
     #[test]
-    fn catalog_has_verified_sizes() {
-        // Guard against accidental URL/size drift in the catalog.
-        assert_eq!(MODELS.len(), 4);
+    fn catalog_entries_are_complete() {
+        assert_eq!(MODELS.len(), 4, "catalog must stay in sync with the release");
         for m in MODELS {
-            assert!(m.url.starts_with("https://alphacephei.com/vosk/models/"));
+            assert!(!m.name.is_empty());
+            assert!(m.lang == "ru" || m.lang == "en");
+            assert!(m.archive_url().starts_with("https://github.com/"));
+            assert!(m.fallback_url.starts_with("https://alphacephei.com/"));
             assert!(m.size_bytes > 0);
         }
     }

@@ -14,3 +14,6 @@ tools/
 # Local docs and logs
 docs/
 *.log
+
+# Model archives for the GitHub mirror release (not for the repo)
+model-archives/
