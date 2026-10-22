@@ -10,6 +10,7 @@ mod hotkey;
 mod inject;
 mod journal;
 mod log;
+mod single;
 mod status;
 mod sync;
 mod text;
@@ -88,6 +89,17 @@ fn run(args: Vec<String>) -> Result<i32> {
             }
             let path = config::config_path(config_override.as_deref());
             let cfg = config::load(&path)?;
+            // One instance only: a second copy would fight over the global
+            // hotkeys and inject recognized text twice.
+            let _single = match single::acquire() {
+                Ok(Some(guard)) => guard,
+                Ok(None) => {
+                    return Err(Error::Config(
+                        "rapcoding уже запущен — закройте другой экземпляр".into(),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
             #[cfg(feature = "gui")]
             {
                 if !no_gui && (gui_flag || cfg.gui.enabled) {
