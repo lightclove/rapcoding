@@ -210,12 +210,28 @@ struct GuiApp {
     journal: Journal,
     dl_state: Arc<Mutex<DlState>>,
     dl_cancel: Option<Arc<AtomicBool>>,
+    delete_confirm: Option<&'static str>,
+    delete_error: Option<String>,
     page: Page,
     theme: Theme,
     applied: Theme,
     persist_error: Option<String>,
     export_error: Option<String>,
     pending_checked: bool,
+}
+
+/// The app icon, embedded at compile time and decoded once (ICO with an
+/// embedded PNG frame; the `image` crate is already in the dependency tree).
+fn app_icon() -> Option<egui::IconData> {
+    const ICO: &[u8] = include_bytes!("../assets/rapcoding.ico");
+    let img = image::load_from_memory_with_format(ICO, image::ImageFormat::Ico).ok()?;
+    let rgba = img.to_rgba8();
+    let (width, height) = (rgba.width(), rgba.height());
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
 }
 
 pub fn run(
@@ -227,12 +243,16 @@ pub fn run(
     _verbose: bool,
 ) -> Result<i32> {
     let theme = Theme::from_config(&cfg.gui.theme);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([980.0, 680.0])
+        .with_min_inner_size([760.0, 460.0])
+        .with_resizable(true)
+        .with_title("rapcoding");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([760.0, 460.0])
-            .with_resizable(true)
-            .with_title("rapcoding"),
+        viewport,
         ..Default::default()
     };
     let app = GuiApp {
@@ -243,6 +263,8 @@ pub fn run(
         journal,
         dl_state: Arc::new(Mutex::new(DlState::Idle)),
         dl_cancel: None,
+        delete_confirm: None,
+        delete_error: None,
         page: start_page(),
         theme,
         applied: theme,
@@ -650,6 +672,19 @@ impl GuiApp {
         let state = sync::lock_recover(&self.dl_state).clone();
         let busy = state.is_busy();
 
+        if let Some(err) = &self.delete_error {
+            Self::card(ui, p, |ui| {
+                ui.label(
+                    RichText::new("Не удалось удалить модель")
+                        .size(13.0)
+                        .color(p.error)
+                        .strong(),
+                );
+                ui.label(RichText::new(err).size(12.0).color(p.muted));
+            });
+            ui.add_space(12.0);
+        }
+
         Self::card(ui, p, |ui| {
             ui.label(
                 RichText::new("Более тяжёлые модели распознают точнее")
@@ -716,18 +751,57 @@ impl GuiApp {
                         {
                             self.start_download(m);
                         }
-                    } else if !active {
-                        if ui
-                            .button("Сделать активной")
-                            .on_hover_text(
-                                "Запишет модель в asr.model / asr.en_model; применится после перезапуска",
-                            )
+                    } else {
+                        if !active {
+                            if ui
+                                .button("Сделать активной")
+                                .on_hover_text(
+                                    "Запишет модель в asr.model / asr.en_model; применится после перезапуска",
+                                )
+                                .clicked()
+                            {
+                                self.activate_model(m);
+                            }
+                        }
+                        if self.delete_confirm == Some(m.name) {
+                            if ui
+                                .button("Да, удалить")
+                                .on_hover_text("Удалить папку модели с диска — освободит место")
+                                .clicked()
+                            {
+                                self.delete_model(m);
+                            }
+                            if ui.button("Отмена").clicked() {
+                                self.delete_confirm = None;
+                            }
+                        } else if ui
+                            .button("Удалить")
+                            .on_hover_text("Стереть скачанную модель с диска")
                             .clicked()
                         {
-                            self.activate_model(m);
+                            self.delete_confirm = Some(m.name);
                         }
                     }
                 });
+
+                if self.delete_confirm == Some(m.name) {
+                    ui.add_space(6.0);
+                    if active {
+                        ui.label(
+                            RichText::new(
+                                "Это активная модель: после удаления распознавание не заработает, пока не выберете другую.",
+                            )
+                            .size(11.5)
+                            .color(p.error),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new("Будет удалена папка модели — место на диске освободится.")
+                                .size(11.5)
+                                .color(p.muted),
+                        );
+                    }
+                }
 
                 if is_current {
                     match &state {
@@ -740,9 +814,12 @@ impl GuiApp {
                                 0.0
                             };
                             ui.add_space(8.0);
+                            // Cap the bar to the visible width: an infinite
+                            // desired width overflows the card on Windows.
+                            let bar_w = ui.available_width();
                             ui.add(
                                 egui::ProgressBar::new(frac)
-                                    .desired_width(f32::INFINITY)
+                                    .desired_width(bar_w)
                                     .text(format!(
                                         "{} / {}",
                                         download::human_size(*received),
@@ -1009,6 +1086,22 @@ impl GuiApp {
         });
     }
 
+    /// Remove an installed model from disk (with confirmation done in the UI).
+    fn delete_model(&mut self, m: &'static download::Model) {
+        let root = config::config_dir().join("models");
+        match download::remove_model(&root, m.name) {
+            Ok(()) => {
+                self.journal
+                    .append("download", &format!("delete model {}", m.name));
+                self.delete_confirm = None;
+                self.delete_error = None;
+            }
+            Err(e) => {
+                self.delete_error = Some(e.to_string());
+            }
+        }
+    }
+
     fn activate_model(&mut self, m: &'static download::Model) {
         let value = m.config_value();
         if m.lang == "ru" {
@@ -1248,6 +1341,13 @@ mod tests {
     fn pretty_hotkey_capitalizes() {
         assert_eq!(pretty_hotkey("ctrl+alt+space"), "Ctrl + Alt + Space");
         assert_eq!(pretty_hotkey("f9"), "F9");
+    }
+
+    #[test]
+    fn embedded_icon_decodes() {
+        let icon = app_icon().expect("embedded ICO must decode");
+        assert!(icon.width > 0 && icon.height > 0);
+        assert_eq!(icon.rgba.len() as u32, icon.width * icon.height * 4);
     }
 
     #[test]

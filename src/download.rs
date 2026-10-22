@@ -138,6 +138,18 @@ fn download_inner(
     Ok(())
 }
 
+/// Delete an installed model: its directory and any leftover partial
+/// archive. Frees disk space; the catalog entry itself stays in the list.
+pub fn remove_model(models_root: &Path, name: &str) -> Result<()> {
+    let dir = model_dir(models_root, name);
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+    }
+    let part = models_root.join(format!("{name}.zip.part"));
+    let _ = fs::remove_file(&part);
+    Ok(())
+}
+
 /// Extract a zip archive into `dest_dir`. Entry paths are sanitized via
 /// `enclosed_name` (rejects `..` traversal) — a malicious archive cannot write
 /// outside `dest_dir`.
@@ -207,6 +219,23 @@ mod tests {
             assert!(m.url.starts_with("https://alphacephei.com/vosk/models/"));
             assert!(m.size_bytes > 0);
         }
+    }
+
+    #[test]
+    fn remove_model_deletes_dir_and_partial() {
+        let dir = tmp("dl-remove");
+        let root = dir.join("models");
+        let model = model_dir(&root, "vosk-model-ru-0.42");
+        fs::create_dir_all(model.join("am")).unwrap();
+        fs::write(model.join("am/final.mdl"), b"x").unwrap();
+        fs::write(root.join("vosk-model-ru-0.42.zip.part"), b"partial").unwrap();
+        remove_model(&root, "vosk-model-ru-0.42").unwrap();
+        assert!(!model.exists(), "model dir must be gone");
+        assert!(
+            !root.join("vosk-model-ru-0.42.zip.part").exists(),
+            "partial archive must be gone"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
