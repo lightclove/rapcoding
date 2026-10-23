@@ -429,4 +429,20 @@ mod tests {
         assert_eq!(loaded, cfg);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn save_load_device_name_unicode_quotes() {
+        // A real Bluetooth endpoint name: apostrophe U+2019, quotes, spaces.
+        let mut cfg = Config::default();
+        cfg.audio.device = "Головной телефон (2- Мирон’s \"AirPods Pro\" - Find My)".into();
+        let path = std::env::temp_dir().join(format!(
+            "rapcoding-config-unicode-{}.toml",
+            std::process::id()
+        ));
+        save(&path, &cfg).expect("save must succeed");
+        let loaded = load(&path).expect("load must succeed");
+        assert_eq!(loaded.audio.device, cfg.audio.device);
+        let _ = std::fs::remove_file(&path);
+    }
 }

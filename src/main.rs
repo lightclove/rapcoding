@@ -701,24 +701,24 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
 }
 
 fn cmd_devices() -> Result<i32> {
-    use cpal::traits::HostTrait;
-    let host = cpal::default_host();
-    let default = host
-        .default_input_device()
-        .map(|d| d.to_string())
-        .unwrap_or_default();
+    let inputs = audio::list_input_devices()?;
     let mut n = 0;
-    for d in host
-        .input_devices()
-        .map_err(|e| Error::Audio(format!("{e}")))?
-    {
-        let name = d.to_string();
-        let mark = if name == default { " (default)" } else { "" };
-        println!("{name}{mark}");
+    for d in &inputs {
+        let mark = if d.is_default { " (default)" } else { "" };
+        println!("{}{mark}", d.name);
         n += 1;
     }
     if n == 0 {
         println!("no input devices found");
+    }
+    let outputs = audio::list_output_devices()?;
+    if !outputs.is_empty() {
+        println!();
+        println!("output:");
+        for d in &outputs {
+            let mark = if d.is_default { " (default)" } else { "" };
+            println!("{}{mark}", d.name);
+        }
     }
     Ok(0)
 }

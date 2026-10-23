@@ -9,7 +9,8 @@ max_record_secs = 120      # hard stop to avoid runaway recording
 log_transcripts = false    # privacy: keep recognized text out of the log
 
 [audio]
-device = ""                # empty = system default input; otherwise a case-insensitive substring
+device = ""                # empty = system default input; otherwise the exact device name
+                            # (or a substring of it) — pick it in the GUI «Звук» page or `rapcoding devices`
 silence_threshold = 0.008  # abs sample value below this is treated as silence (0.0..1.0)
 silence_padding_ms = 200   # silence kept around detected speech
 min_speech_ms = 250        # reject shorter utterances as noise

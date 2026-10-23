@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, text::LayoutJob, Color32, CornerRadius, FontId, Margin, RichText, Stroke, TextFormat};
 
+use crate::audio;
 use crate::config::{self, Config};
 use crate::download;
 use crate::error::Result;
@@ -149,6 +150,7 @@ impl Theme {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     Overview,
+    Sound,
     Models,
     Help,
     Log,
@@ -156,8 +158,9 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 5] = [
+    const ALL: [Page; 6] = [
         Page::Overview,
+        Page::Sound,
         Page::Models,
         Page::Help,
         Page::Log,
@@ -167,6 +170,7 @@ impl Page {
     fn title(self) -> &'static str {
         match self {
             Page::Overview => "Обзор",
+            Page::Sound => "Звук",
             Page::Models => "Модели",
             Page::Help => "Инструкция",
             Page::Log => "Лог",
@@ -177,6 +181,7 @@ impl Page {
     fn hint(self) -> &'static str {
         match self {
             Page::Overview => "Статус, хоткеи и активные модели",
+            Page::Sound => "Какой микрофон использовать и куда идёт вывод",
             Page::Models => "Скачать модель, сделать её активной",
             Page::Help => "Пошаговая инструкция и голосовые команды",
             Page::Log => "Живой лог программы и экспорт в файл",
@@ -218,6 +223,10 @@ struct GuiApp {
     persist_error: Option<String>,
     export_error: Option<String>,
     pending_checked: bool,
+    input_devices: Vec<audio::DeviceInfo>,
+    output_devices: Vec<audio::DeviceInfo>,
+    sound_page_dirty: bool,
+    sound_error: Option<String>,
 }
 
 /// The app icon, embedded at compile time and decoded once (ICO with an
@@ -271,6 +280,10 @@ pub fn run(
         persist_error: None,
         export_error: None,
         pending_checked: false,
+        input_devices: Vec::new(),
+        output_devices: Vec::new(),
+        sound_page_dirty: true,
+        sound_error: None,
     };
     eframe::run_native(
         "rapcoding",
@@ -289,6 +302,7 @@ pub fn run(
 /// screenshot automation; harmless in normal use).
 fn start_page() -> Page {
     match std::env::var("RAPCODING_START_PAGE").unwrap_or_default().as_str() {
+        "sound" => Page::Sound,
         "models" => Page::Models,
         "help" => Page::Help,
         "log" => Page::Log,
@@ -329,6 +343,7 @@ impl eframe::App for GuiApp {
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.page {
                         Page::Overview => self.overview(ui, p),
+                        Page::Sound => self.sound(ui, p),
                         Page::Models => self.models(ui, p),
                         Page::Help => Self::help(ui, p),
                         Page::Log => self.logs(ui, p),
@@ -450,6 +465,10 @@ impl GuiApp {
                         .interact(egui::Sense::click())
                         .on_hover_text(page.hint());
                     if resp.clicked() {
+                        if self.page != page && page == Page::Sound {
+                            // BT devices appear and disappear; re-enumerate on entry.
+                            self.sound_page_dirty = true;
+                        }
                         self.page = page;
                     }
                     if resp.hovered() {
@@ -550,6 +569,214 @@ impl GuiApp {
                 ui.label(RichText::new("· вставка отключена").size(11.5).color(p.error))
                     .on_hover_text("inject.enabled = false — текст не вставляется");
             }
+        });
+    }
+
+    // ----------------------------------------------------------------- sound
+
+    fn sound(&mut self, ui: &mut egui::Ui, p: Palette) {
+        if self.sound_page_dirty {
+            self.sound_page_dirty = false;
+            match (
+                audio::list_input_devices(),
+                audio::list_output_devices(),
+            ) {
+                (Ok(inputs), Ok(outputs)) => {
+                    self.input_devices = inputs;
+                    self.output_devices = outputs;
+                    self.sound_error = None;
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    self.sound_error = Some(e.to_string());
+                }
+            }
+        }
+        if let Some(err) = &self.sound_error {
+            Self::card(ui, p, |ui| {
+                ui.label(
+                    RichText::new("Не удалось получить список устройств")
+                        .size(14.0)
+                        .strong()
+                        .color(p.error),
+                );
+                ui.label(RichText::new(err).size(12.5).color(p.error));
+            });
+            return;
+        }
+        if let Some(err) = &self.persist_error {
+            ui.colored_label(p.error, err);
+        }
+
+        let names: Vec<String> = self.input_devices.iter().map(|d| d.name.clone()).collect();
+        // Which device the configured filter resolves to right now (None = default).
+        let checked: Option<String> =
+            audio::pick_index(&self.cfg.audio.device, &names).map(|i| names[i].clone());
+        let mut value = checked
+            .clone()
+            .unwrap_or_else(|| self.cfg.audio.device.clone());
+        let mut changed = false;
+
+        Self::card(ui, p, |ui| {
+            ui.label(
+                RichText::new("Микрофон (ввод)")
+                    .size(16.0)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.label(
+                RichText::new(
+                    "Отсюда rapcoding пишет звук для распознавания. Применяется после перезапуска программы.",
+                )
+                .size(12.5)
+                .color(p.muted),
+            );
+            ui.add_space(8.0);
+
+            let default_name = self
+                .input_devices
+                .iter()
+                .find(|d| d.is_default)
+                .map(|d| d.name.as_str())
+                .unwrap_or("нет устройства");
+            let row = ui.selectable_value(
+                &mut value,
+                String::new(),
+                RichText::new(format!("Система по умолчанию — {default_name}"))
+                    .size(13.0)
+                    .color(p.text),
+            );
+            if row.clicked() {
+                changed = true;
+            }
+
+            for d in &self.input_devices {
+                let mut text = RichText::new(format!(
+                    "{}{}",
+                    d.name,
+                    if d.is_default { "  (по умолчанию)" } else { "" }
+                ))
+                .size(13.0)
+                .color(p.text);
+                if d.is_default {
+                    text = text.strong();
+                }
+                let mut hover = d.name.clone();
+                let sum = d.summary();
+                if !sum.is_empty() {
+                    hover = format!("{} — {sum}", d.name);
+                }
+                let row = ui
+                    .selectable_value(&mut value, d.name.clone(), text)
+                    .on_hover_text(hover);
+                if row.clicked() {
+                    changed = true;
+                }
+            }
+
+            if let Some(i) = audio::pick_index(&value, &names) {
+                let sum = self.input_devices[i].summary();
+                if !sum.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("Формат захвата: {sum}"))
+                            .size(12.0)
+                            .color(p.muted),
+                    );
+                }
+            }
+            if !self.cfg.audio.device.is_empty() && checked.is_none() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Настроенное устройство «{}» сейчас не видно (отключено?). Пока оно не вернётся или не выберете другое — демон не стартует.",
+                        self.cfg.audio.device
+                    ))
+                    .size(12.0)
+                    .color(p.warn),
+                );
+            }
+            ui.add_space(6.0);
+            if ui
+                .button("Обновить список")
+                .on_hover_text("Bluetooth-устройства подключаются и отключаются — список перечитывается при входе на страницу и по этой кнопке")
+                .clicked()
+            {
+                self.sound_page_dirty = true;
+            }
+        });
+
+        if changed && value != self.cfg.audio.device {
+            self.cfg.audio.device = value;
+            let what = if self.cfg.audio.device.is_empty() {
+                "system default".to_string()
+            } else {
+                format!("\"{}\"", self.cfg.audio.device)
+            };
+            self.journal
+                .append("config", &format!("audio device -> {what}"));
+            self.persist_error = match config::save(&self.config_path, &self.cfg) {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            };
+        }
+
+        ui.add_space(12.0);
+        Self::card(ui, p, |ui| {
+            ui.label(
+                RichText::new("Вывод (наушники/динамики)")
+                    .size(16.0)
+                    .strong()
+                    .color(p.text),
+            );
+            ui.label(
+                RichText::new(
+                    "rapcoding ничего не воспроизводит — этот список только для справки. Устройство вывода по умолчанию меняется в Параметры → Система → Звук.",
+                )
+                .size(12.5)
+                .color(p.muted),
+            );
+            ui.add_space(8.0);
+            if self.output_devices.is_empty() {
+                ui.label(
+                    RichText::new("Устройства вывода не найдены")
+                        .size(12.5)
+                        .color(p.warn),
+                );
+            }
+            for d in &self.output_devices {
+                let mut text = RichText::new(format!(
+                    "{}{}",
+                    d.name,
+                    if d.is_default { "  (по умолчанию)" } else { "" }
+                ))
+                .size(13.0)
+                .color(p.text);
+                if d.is_default {
+                    text = text.strong();
+                }
+                let sum = d.summary();
+                let resp = ui.label(text);
+                if !sum.is_empty() {
+                    resp.on_hover_text(format!("{} — {sum}", d.name));
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+        Self::card(ui, p, |ui| {
+            ui.label(
+                RichText::new("Bluetooth-гарнитуры (AirPods и др.)")
+                    .size(13.0)
+                    .strong()
+                    .color(p.info),
+            );
+            ui.label(
+                RichText::new(
+                    "Микрофон наушников доступен только в профиле Hands-Free (моно, телефонное качество 8–16 кГц) — распознавание может быть хуже, чем у встроенного микрофона. «Наушники» (стерео A2DP) микрофона не имеют.",
+                )
+                .size(12.0)
+                .color(p.muted),
+            );
         });
     }
 

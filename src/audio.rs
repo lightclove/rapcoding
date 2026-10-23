@@ -27,29 +27,7 @@ pub struct AudioCapture {
 
 impl AudioCapture {
     pub fn new(device_filter: &str) -> Result<Self> {
-        let host = cpal::default_host();
-        let device = if device_filter.is_empty() {
-            host.default_input_device()
-                .ok_or_else(|| Error::Audio("no default input device".into()))?
-        } else {
-            let mut found = None;
-            for d in host
-                .input_devices()
-                .map_err(|e| Error::Audio(format!("enumerate input devices: {e}")))?
-            {
-                if d.to_string()
-                    .to_lowercase()
-                    .contains(&device_filter.to_lowercase())
-                {
-                    found = Some(d);
-                    break;
-                }
-            }
-            found.ok_or_else(|| {
-                Error::Audio(format!("no input device matching '{device_filter}'"))
-            })?
-        };
-
+        let device = resolve_input_device(device_filter)?;
         let device_name = device.to_string();
         let supported = device
             .default_input_config()
@@ -127,6 +105,123 @@ impl AudioCapture {
 
     pub fn device_name(&self) -> &str {
         &self.device_name
+    }
+}
+
+/// A selectable audio endpoint, as shown in the GUI and `rapcoding devices`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub is_default: bool,
+    /// Native default config (None when the endpoint refuses to report one).
+    pub rate: Option<u32>,
+    pub channels: Option<u16>,
+}
+
+impl DeviceInfo {
+    /// Human summary of the native format, e.g. "48 кГц · стерео".
+    pub fn summary(&self) -> String {
+        match (self.rate, self.channels) {
+            (Some(r), Some(c)) => {
+                let ch = match c {
+                    1 => "моно".to_string(),
+                    2 => "стерео".to_string(),
+                    _ => format!("{c} кан."),
+                };
+                format!("{} кГц · {ch}", r / 1000)
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+/// Enumerate input (capture) endpoints; the system default is marked.
+pub fn list_input_devices() -> Result<Vec<DeviceInfo>> {
+    let host = cpal::default_host();
+    let default_name = host.default_input_device().map(|d| d.to_string());
+    let mut out = Vec::new();
+    for d in host
+        .input_devices()
+        .map_err(|e| Error::Audio(format!("enumerate input devices: {e}")))?
+    {
+        let name = d.to_string();
+        let (rate, channels) = match d.default_input_config() {
+            Ok(c) => (Some(c.sample_rate()), Some(c.channels())),
+            Err(_) => (None, None),
+        };
+        out.push(DeviceInfo {
+            is_default: Some(&name) == default_name.as_ref(),
+            name,
+            rate,
+            channels,
+        });
+    }
+    Ok(out)
+}
+
+/// Enumerate output (render) endpoints; the system default is marked.
+pub fn list_output_devices() -> Result<Vec<DeviceInfo>> {
+    let host = cpal::default_host();
+    let default_name = host.default_output_device().map(|d| d.to_string());
+    let mut out = Vec::new();
+    for d in host
+        .output_devices()
+        .map_err(|e| Error::Audio(format!("enumerate output devices: {e}")))?
+    {
+        let name = d.to_string();
+        let (rate, channels) = match d.default_output_config() {
+            Ok(c) => (Some(c.sample_rate()), Some(c.channels())),
+            Err(_) => (None, None),
+        };
+        out.push(DeviceInfo {
+            is_default: Some(&name) == default_name.as_ref(),
+            name,
+            rate,
+            channels,
+        });
+    }
+    Ok(out)
+}
+
+/// Index of the device chosen for `filter` among `names`. An exact
+/// (case-insensitive) match wins over a substring match so that picking
+/// "AirPods Pro" cannot accidentally select "AirPods Pro Hands-Free".
+/// Empty filter = "use the system default" (caller treats None accordingly).
+pub fn pick_index(filter: &str, names: &[String]) -> Option<usize> {
+    if filter.is_empty() {
+        return None;
+    }
+    let f = filter.to_lowercase();
+    names
+        .iter()
+        .position(|n| n.to_lowercase() == f)
+        .or_else(|| names.iter().position(|n| n.to_lowercase().contains(&f)))
+}
+
+/// Resolve the configured `audio.device` filter to a concrete capture device.
+/// Empty filter = system default. A filter matching nothing is an error: the
+/// daemon must fail loudly instead of recording from the wrong microphone.
+pub fn resolve_input_device(filter: &str) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    if filter.is_empty() {
+        return host
+            .default_input_device()
+            .ok_or_else(|| Error::Audio("no default input device".into()));
+    }
+    let mut devices: Vec<(cpal::Device, String)> = Vec::new();
+    for d in host
+        .input_devices()
+        .map_err(|e| Error::Audio(format!("enumerate input devices: {e}")))?
+    {
+        let name = d.to_string();
+        devices.push((d, name));
+    }
+    let names: Vec<String> = devices.iter().map(|(_, n)| n.clone()).collect();
+    match pick_index(filter, &names) {
+        Some(i) => Ok(devices[i].0.clone()),
+        None => Err(Error::Audio(format!(
+            "no input device matching '{filter}'"
+        ))),
     }
 }
 
@@ -275,6 +370,75 @@ pub fn trim_silence(input: &[f32], threshold: f32, padding_samples: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pick_exact_beats_substring() {
+        let names: Vec<String> = [
+            "Головной телефон (AirPods Pro Hands-Free)",
+            "Головной телефон (2- AirPods Pro)",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(pick_index("Головной телефон (2- AirPods Pro)", &names), Some(1));
+    }
+
+    #[test]
+    fn pick_is_case_insensitive() {
+        let names: Vec<String> = vec!["Микрофон AirPods Pro".to_string()];
+        assert_eq!(pick_index("airpods", &names), Some(0));
+    }
+
+    #[test]
+    fn pick_empty_filter_means_default() {
+        let names: Vec<String> = vec!["X".to_string()];
+        assert_eq!(pick_index("", &names), None);
+    }
+
+    #[test]
+    fn pick_no_match_is_none() {
+        let names: Vec<String> = vec!["A".to_string(), "B".to_string()];
+        assert_eq!(pick_index("zzz", &names), None);
+    }
+
+    #[test]
+    fn pick_substring_backward_compat() {
+        let names: Vec<String> = vec!["Набор микрофонов (Intel)".to_string()];
+        assert_eq!(pick_index("микрофонов", &names), Some(0));
+    }
+
+    #[test]
+    fn device_summary_stereo() {
+        let d = DeviceInfo {
+            name: "x".into(),
+            is_default: false,
+            rate: Some(48_000),
+            channels: Some(2),
+        };
+        assert_eq!(d.summary(), "48 кГц · стерео");
+    }
+
+    #[test]
+    fn device_summary_mono() {
+        let d = DeviceInfo {
+            name: "x".into(),
+            is_default: false,
+            rate: Some(16_000),
+            channels: Some(1),
+        };
+        assert_eq!(d.summary(), "16 кГц · моно");
+    }
+
+    #[test]
+    fn device_summary_unknown_format_is_empty() {
+        let d = DeviceInfo {
+            name: "x".into(),
+            is_default: false,
+            rate: None,
+            channels: None,
+        };
+        assert_eq!(d.summary(), "");
+    }
 
     #[test]
     fn resample_48k_to_16k_length() {
