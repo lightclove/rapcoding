@@ -857,7 +857,7 @@ USAGE:
 COMMANDS:
   run              Run the voice input daemon (default)
   check            Validate config, audio device, hotkey, ASR command/model
-  devices          List input devices
+  devices          List input devices (and output devices after an `output:` section)
   transcribe <wav> Transcribe a 16 kHz mono WAV and print the text
   inject <text>    Inject text at the cursor (test)
   init             Write a default config file

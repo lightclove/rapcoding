@@ -158,11 +158,25 @@ impl Theme {
     }
 
     fn style(&self, ctx: &egui::Context) {
-        let mut s = (*ctx.style()).clone();
-        s.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        s.spacing.button_padding = egui::vec2(12.0, 7.0);
-        s.visuals.widgets.noninteractive.corner_radius = CornerRadius::same(10);
-        ctx.set_style(s);
+        // egui 0.32 keeps a separate Style per egui theme and picks the one
+        // matching the OS theme. Writing only the "current" one made a dark
+        // app render with light-theme widget fills on a light-mode Windows
+        // (white button / white tooltip with white text). Apply to both.
+        let visuals = self.visuals();
+        for t in [egui::Theme::Light, egui::Theme::Dark] {
+            ctx.set_visuals_of(t, visuals.clone());
+        }
+        ctx.all_styles_mut(|s| {
+            s.spacing.item_spacing = egui::vec2(10.0, 10.0);
+            s.spacing.button_padding = egui::vec2(12.0, 7.0);
+            s.visuals.widgets.noninteractive.corner_radius = CornerRadius::same(10);
+        });
+        // Pin the widget theme to the app theme: an app-level dark theme must
+        // not flip to light widgets just because Windows is in light mode.
+        ctx.set_theme(match self {
+            Theme::Light => egui::ThemePreference::Light,
+            Theme::Dark => egui::ThemePreference::Dark,
+        });
     }
 }
 
@@ -342,7 +356,6 @@ pub fn run(
         "rapcoding",
         options,
         Box::new(move |cc| {
-            cc.egui_ctx.set_visuals(theme.visuals());
             theme.style(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
@@ -376,7 +389,6 @@ impl eframe::App for GuiApp {
         }
         if self.theme != self.applied {
             self.applied = self.theme;
-            ctx.set_visuals(self.theme.visuals());
             self.theme.style(ctx);
         }
         let p = self.theme.palette();
@@ -2702,5 +2714,21 @@ mod tests {
         // Assert: files stay put unless the user opts in.
         assert!(!d.move_models);
         assert!(d.pending_move.is_none());
+    }
+}
+
+#[cfg(test)]
+mod palette_tests {
+    use super::*;
+
+    #[test]
+    fn dark_visuals_contrast() {
+        let v = Theme::Dark.visuals();
+        let p = Palette::dark();
+        println!("inactive bg={:?} weak={:?} fg={:?}", v.widgets.inactive.bg_fill, v.widgets.inactive.weak_bg_fill, v.widgets.inactive.fg_stroke.color);
+        println!("hovered  bg={:?} weak={:?} fg={:?}", v.widgets.hovered.bg_fill, v.widgets.hovered.weak_bg_fill, v.widgets.hovered.fg_stroke.color);
+        println!("extreme={:?} panel={:?} window={:?} text_override={:?}", v.extreme_bg_color, v.panel_fill, v.window_fill, v.override_text_color);
+        println!("palette text={:?} surface={:?}", p.text, p.surface);
+        assert_eq!(v.widgets.inactive.weak_bg_fill, p.surface);
     }
 }
