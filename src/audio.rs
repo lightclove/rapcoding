@@ -120,6 +120,7 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     /// Human summary of the native format, e.g. "48 кГц · стерео".
+    #[cfg(feature = "gui")]
     pub fn summary(&self) -> String {
         match (self.rate, self.channels) {
             (Some(r), Some(c)) => {
@@ -407,6 +408,7 @@ mod tests {
         assert_eq!(pick_index("микрофонов", &names), Some(0));
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn device_summary_stereo() {
         let d = DeviceInfo {
@@ -418,6 +420,7 @@ mod tests {
         assert_eq!(d.summary(), "48 кГц · стерео");
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn device_summary_mono() {
         let d = DeviceInfo {
@@ -429,6 +432,7 @@ mod tests {
         assert_eq!(d.summary(), "16 кГц · моно");
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn device_summary_unknown_format_is_empty() {
         let d = DeviceInfo {

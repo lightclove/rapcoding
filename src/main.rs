@@ -19,7 +19,7 @@ mod wav;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use config::Config;
@@ -192,7 +192,17 @@ struct WorkResult {
 fn cmd_run(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
     let status = Arc::new(Mutex::new(Status::Idle));
     let journal = Journal::new(config::config_dir().join("journal.log"));
-    let daemon = Daemon::start(cfg, &path, verbose, status, None, &journal)?;
+    let shared_cfg = Arc::new(RwLock::new(cfg.clone()));
+    let transcripts = Arc::new(AtomicBool::new(cfg.general.log_transcripts));
+    let daemon = Daemon::start(
+        shared_cfg,
+        transcripts,
+        &path,
+        verbose,
+        status,
+        None,
+        &journal,
+    )?;
     daemon.run()
 }
 
@@ -201,11 +211,19 @@ fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
     let status = Arc::new(Mutex::new(Status::Idle));
     let live = LiveLog::new(500);
     let journal = Journal::new(config::config_dir().join("journal.log"));
+    // Config shared between the daemon and the GUI: the settings page writes
+    // here on save, and the daemon snapshots it per utterance, so the live
+    // subset (text.*, audio thresholds, max_record_secs, log_transcripts)
+    // applies without a restart. Structural fields (hotkeys, device,
+    // inject.*, models, mode) are read once at Daemon::start.
+    let shared_cfg = Arc::new(RwLock::new(cfg.clone()));
+    let transcripts = Arc::new(AtomicBool::new(cfg.general.log_transcripts));
     // The window must open even when the daemon cannot start (missing model,
     // no microphone, hotkey conflict): the user needs the UI to fix it, and an
     // invisible failure would look like the app simply does nothing.
     match Daemon::start(
-        cfg.clone(),
+        shared_cfg.clone(),
+        transcripts.clone(),
         &path,
         verbose,
         status.clone(),
@@ -241,7 +259,9 @@ fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
 /// failures (bad config, missing audio/model, hotkey conflict) surface to the
 /// caller instead of dying silently on a background thread.
 struct Daemon {
-    cfg: Config,
+    /// Shared config: snapshot per utterance (dispatch) and per loop tick
+    /// (max_record_secs). See the live-subset contract in `cmd_gui`.
+    cfg: Arc<RwLock<Config>>,
     mode: Mode,
     logger: Logger,
     audio: audio::AudioCapture,
@@ -254,27 +274,28 @@ struct Daemon {
     work_rx: mpsc::Receiver<WorkResult>,
     busy: Arc<AtomicBool>,
     en: Arc<Mutex<Option<asr::VoskAsr>>>,
-    max: Duration,
     status: Arc<Mutex<Status>>,
 }
 
 impl Daemon {
     fn start(
-        cfg: Config,
+        cfg: Arc<RwLock<Config>>,
+        transcripts: Arc<AtomicBool>,
         path: &Path,
         verbose: bool,
         status: Arc<Mutex<Status>>,
         live: Option<LiveLog>,
         journal: &Journal,
     ) -> Result<Self> {
+        let init = sync::read_recover(&cfg).clone();
         let level = if verbose { Level::Debug } else { Level::Info };
         let log_path = config::config_dir().join("rapcoding.log");
-        let logger = Logger::new_with_live(log_path, level, cfg.general.log_transcripts, live)?;
+        let logger = Logger::new_with_live(log_path, level, transcripts, live)?;
         logger.info(&format!("rapcoding {VERSION} starting; config {}", path.display()));
         journal.append("session", &format!("start; config {}", path.display()));
 
-        let mode = parse_mode(&cfg.general.mode)?;
-        let audio = audio::AudioCapture::new(&cfg.audio.device)?;
+        let mode = parse_mode(&init.general.mode)?;
+        let audio = audio::AudioCapture::new(&init.audio.device)?;
         logger.info(&format!(
             "audio device '{}' {} Hz {} ch",
             audio.device_name(),
@@ -283,30 +304,29 @@ impl Daemon {
         ));
 
         let base_dir = config_dir_of(path);
-        let model_dir = config::resolve_model_path(&base_dir, &cfg.asr.model);
-        let en_model_dir = config::resolve_model_path(&base_dir, &cfg.asr.en_model);
+        let model_dir = config::resolve_model_path(&base_dir, &init.asr.model);
+        let en_model_dir = config::resolve_model_path(&base_dir, &init.asr.en_model);
         let asr = asr::VoskAsr::new(&model_dir)?;
         if let Err(e) = asr.check() {
             logger.warn(&format!("asr not ready: {e} (recognition will fail)"));
         }
-        logger.debug(&format!("asr: model={} en_model={}", cfg.asr.model, cfg.asr.en_model));
+        logger.debug(&format!("asr: model={} en_model={}", init.asr.model, init.asr.en_model));
         let injector = inject::Injector::new(
-            cfg.inject.enabled,
-            &cfg.inject.method,
-            &cfg.inject.paste_shortcut,
-            cfg.inject.restore_clipboard,
-            cfg.inject.settle_ms,
+            init.inject.enabled,
+            &init.inject.method,
+            &init.inject.paste_shortcut,
+            init.inject.restore_clipboard,
+            init.inject.settle_ms,
         )?;
 
         let (hot_tx, hot_rx) = mpsc::channel::<hotkey::HotMsg>();
-        let bindings = vec![cfg.general.hotkey.clone(), cfg.general.en_hotkey.clone()];
+        let bindings = vec![init.general.hotkey.clone(), init.general.en_hotkey.clone()];
         let hotkeys = hotkey::spawn_hotkeys(&bindings, hot_tx)?;
         for b in &bindings {
-            logger.info(&format!("hotkey '{b}' registered (mode {})", cfg.general.mode));
+            logger.info(&format!("hotkey '{b}' registered (mode {})", init.general.mode));
         }
 
         let (work_tx, work_rx) = mpsc::channel::<WorkResult>();
-        let max = Duration::from_secs(cfg.general.max_record_secs.max(1));
         Ok(Daemon {
             cfg,
             mode,
@@ -321,7 +341,6 @@ impl Daemon {
             work_rx,
             busy: Arc::new(AtomicBool::new(false)),
             en: Arc::new(Mutex::new(None::<asr::VoskAsr>)),
-            max,
             status,
         })
     }
@@ -337,11 +356,14 @@ impl Daemon {
         self.busy.store(true, Ordering::Relaxed);
         self.set_status(Status::Transcribing(lang.name()));
         self.logger.info(&format!("transcribing… ({})", lang.name()));
+        // Snapshot the shared config: the live subset edited in the settings
+        // page (text.*, audio thresholds) takes effect on the next utterance.
+        let cfg = sync::read_recover(&self.cfg).clone();
         spawn_worker(
             samples,
             self.audio.device_rate(),
             lang,
-            self.cfg.clone(),
+            cfg,
             self.asr.clone(),
             self.en.clone(),
             self.en_model_dir.clone(),
@@ -418,10 +440,14 @@ impl Daemon {
                 self.set_status(Status::Idle);
             }
 
-            // Auto-stop runaway recordings.
+            // Auto-stop runaway recordings. The limit is read live from the
+            // shared config: a settings change applies without a restart.
             if let Some(start_id) = recording {
                 if let Some(el) = self.audio.elapsed() {
-                    if el >= self.max {
+                    let max = Duration::from_secs(
+                        sync::read_recover(&self.cfg).general.max_record_secs.max(1),
+                    );
+                    if el >= max {
                         recording = None;
                         self.logger.info("auto-stop at max duration");
                         let samples = self.audio.stop();

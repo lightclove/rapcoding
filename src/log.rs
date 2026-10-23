@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -26,7 +27,9 @@ struct Inner {
     path: PathBuf,
     level: Level,
     start: Instant,
-    log_transcripts: bool,
+    /// Shared with the GUI: toggling `log_transcripts` in settings applies
+    /// live, without restarting the daemon (or its logger).
+    log_transcripts: Arc<AtomicBool>,
     live: Option<LiveLog>,
 }
 
@@ -34,7 +37,7 @@ impl Logger {
     pub fn new_with_live(
         path: PathBuf,
         level: Level,
-        log_transcripts: bool,
+        log_transcripts: Arc<AtomicBool>,
         live: Option<LiveLog>,
     ) -> Result<Self> {
         let mut inner = Inner {
@@ -62,12 +65,13 @@ impl Logger {
     }
 
     /// Log a transcript only if explicitly enabled (privacy default is off).
+    /// The flag is read on every call, so a settings change applies live.
     pub fn transcript(&self, msg: &str) {
         // Scope the guard explicitly: `self.info` re-acquires the same mutex,
         // and a guard held across that call would deadlock.
         let enabled = {
             let inner = crate::sync::lock_recover(&self.inner);
-            inner.log_transcripts
+            inner.log_transcripts.load(Ordering::Relaxed)
         };
         if enabled {
             self.info(msg);
@@ -209,7 +213,7 @@ mod tests {
             path: path.clone(),
             level: Level::Info,
             start: Instant::now(),
-            log_transcripts: false,
+            log_transcripts: Arc::new(AtomicBool::new(false)),
             live: None,
         };
         inner.rotate_if_needed().unwrap();
@@ -236,7 +240,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new_with_live(path.clone(), Level::Info, false, None).unwrap();
+        let logger = Logger::new_with_live(
+            path.clone(),
+            Level::Info,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
         let inner = logger.inner.clone();
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _g = inner.lock().unwrap();
@@ -254,7 +264,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new_with_live(path.clone(), Level::Info, false, None).unwrap();
+        let logger = Logger::new_with_live(
+            path.clone(),
+            Level::Info,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
         logger.info("line1\nline2\x1b[31mRED\tend");
         let content = fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(content.lines().count(), 1, "one log entry = one line (no raw newline)");
@@ -298,28 +314,71 @@ mod tests {
     }
 
     #[test]
-    fn transcript_not_logged_by_default() {
+    fn transcript_not_logged_when_flag_false() {
+        // Arrange.
         let dir = std::env::temp_dir().join("rapcoding-log-priv");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new_with_live(path.clone(), Level::Info, false, None).unwrap();
+        let logger = Logger::new_with_live(
+            path.clone(),
+            Level::Info,
+            Arc::new(AtomicBool::new(false)),
+            None,
+        )
+        .unwrap();
+        // Act.
         logger.transcript("SECRET");
+        // Assert.
         let content = fs::read_to_string(&path).unwrap_or_default();
-        assert!(!content.contains("SECRET"), "transcripts must not be logged by default");
+        assert!(!content.contains("SECRET"), "transcripts must not be logged when disabled");
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn transcript_logged_when_enabled() {
+    fn transcript_logged_when_flag_true() {
+        // Arrange.
         let dir = std::env::temp_dir().join("rapcoding-log-priv2");
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
-        let logger = Logger::new_with_live(path.clone(), Level::Info, true, None).unwrap();
+        let logger = Logger::new_with_live(
+            path.clone(),
+            Level::Info,
+            Arc::new(AtomicBool::new(true)),
+            None,
+        )
+        .unwrap();
+        // Act.
         logger.transcript("HELLO");
+        // Assert.
         let content = fs::read_to_string(&path).unwrap_or_default();
         assert!(content.contains("HELLO"), "transcripts must be logged when enabled");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_flag_applies_live_without_restart() {
+        // Arrange: enabled at construction.
+        let dir = std::env::temp_dir().join("rapcoding-log-priv3");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rapcoding.log");
+        let flag = Arc::new(AtomicBool::new(true));
+        let logger =
+            Logger::new_with_live(path.clone(), Level::Info, flag.clone(), None).unwrap();
+        // Act 1: disable at runtime — must take effect immediately.
+        flag.store(false, Ordering::Relaxed);
+        logger.transcript("SECRET");
+        // Assert 1.
+        let after_off = fs::read_to_string(&path).unwrap_or_default();
+        assert!(!after_off.contains("SECRET"));
+        // Act 2: re-enable at runtime.
+        flag.store(true, Ordering::Relaxed);
+        logger.transcript("HELLO");
+        // Assert 2.
+        let after_on = fs::read_to_string(&path).unwrap_or_default();
+        assert!(after_on.contains("HELLO"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -354,8 +413,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
         let live = LiveLog::new(100);
-        let logger =
-            Logger::new_with_live(path.clone(), Level::Info, false, Some(live.clone())).unwrap();
+        let logger = Logger::new_with_live(
+            path.clone(),
+            Level::Info,
+            Arc::new(AtomicBool::new(false)),
+            Some(live.clone()),
+        )
+        .unwrap();
         logger.info("hello live");
         let snap = live.snapshot();
         assert!(snap.iter().any(|l| l.contains("hello live")));

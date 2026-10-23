@@ -77,5 +77,6 @@ checks run this turn`. No footer = gate skipped = failure.
 ## Tools
 
 - `node tools/harness_check.mjs` — structural self-check of skills, roles, MCP/LSP config, memory, and tool availability.
+- `node tools/token-thrift-check.mjs` — gate that the token-saving rules are present in AGENTS.md and every referenced skill/tool resolves.
 - `node tools/deepseek-balance.mjs` — real DeepSeek account balance; requires `DEEPSEEK_API_KEY`, never prints the key.
 - Session cost: use the Zed agent usage panel. `tools/pi-cost/` is pi-specific and is not used by this project.
