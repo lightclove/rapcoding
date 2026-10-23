@@ -278,10 +278,27 @@ pub fn load(path: &Path) -> Result<Config> {
 }
 
 /// Serialize a config back to TOML (used by the GUI to persist edits).
+///
+/// Written atomically: first to a `<name>.tmp` sibling, then renamed over
+/// the target (`fs::rename` maps to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
+/// on Windows). A crash or full disk mid-write can therefore never leave a
+/// truncated config that would brick the next start.
 #[cfg(feature = "gui")]
 pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     let s = toml::to_string_pretty(cfg)?;
-    std::fs::write(path, s)?;
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    let write_result = std::fs::write(&tmp, s);
+    if let Err(e) = &write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(Error::Config(format!(
+            "write {}: {e}",
+            tmp.display()
+        )));
+    }
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        Error::Config(format!("rename {} -> {}: {e}", tmp.display(), path.display()))
+    })?;
     Ok(())
 }
 
@@ -419,14 +436,79 @@ mod tests {
     #[cfg(feature = "gui")]
     #[test]
     fn save_load_roundtrip() {
+        // Arrange.
         let cfg = Config::default();
         let path = std::env::temp_dir().join(format!(
             "rapcoding-config-roundtrip-{}.toml",
             std::process::id()
         ));
+        // Act.
         save(&path, &cfg).expect("save must succeed");
         let loaded = load(&path).expect("load must succeed");
+        // Assert.
         assert_eq!(loaded, cfg);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn save_leaves_no_tmp_file() {
+        // Arrange.
+        let path = std::env::temp_dir().join(format!(
+            "rapcoding-config-atomic-{}.toml",
+            std::process::id()
+        ));
+        let cfg = Config::default();
+        // Act.
+        save(&path, &cfg).unwrap();
+        // Assert: only the target file, no temp sibling.
+        let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+        assert!(path.exists());
+        assert!(!tmp.exists(), "temp file must not survive a successful save");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn save_overwrites_existing_file() {
+        // Arrange: an existing file with different content.
+        let path = std::env::temp_dir().join(format!(
+            "rapcoding-config-overwrite-{}.toml",
+            std::process::id()
+        ));
+        let mut old = Config::default();
+        old.general.mode = "toggle".into();
+        save(&path, &old).unwrap();
+        // Act.
+        let mut new = Config::default();
+        new.general.max_record_secs = 7;
+        save(&path, &new).unwrap();
+        // Assert: full replacement, still parseable, new content wins.
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, new);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn failed_save_leaves_existing_file_untouched() {
+        // Arrange: a valid config on disk and a directory squatting on the
+        // temp-file name so the write must fail.
+        let path = std::env::temp_dir().join(format!(
+            "rapcoding-config-fail-{}.toml",
+            std::process::id()
+        ));
+        let good = Config::default();
+        save(&path, &good).unwrap();
+        let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        // Act.
+        let result = save(&path, &good);
+        // Assert: loud error, original file byte-identical.
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_file(&path);
     }
 
