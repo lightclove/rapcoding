@@ -122,8 +122,13 @@ impl Theme {
         v.extreme_bg_color = p.surface;
         v.faint_bg_color = p.surface;
         v.hyperlink_color = p.accent;
-        v.selection.bg_fill = p.accent.gamma_multiply(0.35);
-        v.selection.stroke = Stroke::new(1.0_f32, p.accent);
+        // Selection: a tinted fill that keeps the text readable. The default
+        // `selection.stroke` is used as the SELECTED TEXT colour by
+        // `Style::interact_selectable` (egui 0.32), so it must be the palette
+        // text colour, not the accent — otherwise dark theme draws accent-blue
+        // text on an accent-blue fill (invisible).
+        v.selection.bg_fill = p.accent.gamma_multiply(0.28);
+        v.selection.stroke = Stroke::new(1.0_f32, p.text);
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, p.stroke);
         for w in [
             &mut v.widgets.inactive,
@@ -133,12 +138,22 @@ impl Theme {
         ] {
             w.corner_radius = CornerRadius::same(8);
             w.bg_stroke = Stroke::new(1.0_f32, p.stroke);
+            // Text colour per widget state: a hovered/active button must keep
+            // readable text instead of inheriting egui's light-theme default.
+            w.fg_stroke = Stroke::new(1.0_f32, p.text);
         }
+        v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, p.text);
         v.widgets.inactive.weak_bg_fill = p.surface;
         v.widgets.inactive.bg_fill = p.surface;
         v.widgets.hovered.weak_bg_fill = p.bg;
         v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.accent);
-        v.widgets.active.weak_bg_fill = p.accent.gamma_multiply(0.25);
+        v.widgets.hovered.bg_fill = p.surface;
+        v.widgets.active.weak_bg_fill = p.accent.gamma_multiply(0.22);
+        v.widgets.active.bg_fill = p.accent.gamma_multiply(0.22);
+        v.widgets.open.weak_bg_fill = p.surface;
+        v.widgets.open.bg_fill = p.surface;
+        // Text edit / combo internals: dark theme must not fall back to white.
+        v.text_cursor.stroke = Stroke::new(1.0_f32, p.text);
         v
     }
 
@@ -722,41 +737,33 @@ impl GuiApp {
                 .find(|d| d.is_default)
                 .map(|d| d.name.as_str())
                 .unwrap_or("нет устройства");
-            let row = ui.selectable_value(
-                &mut value,
-                String::new(),
-                RichText::new(format!("Система по умолчанию — {default_name}"))
-                    .size(13.0)
-                    .color(p.text),
+            let row = device_row(
+                ui,
+                p,
+                value.is_empty(),
+                &format!("Система по умолчанию — {default_name}"),
+                &[],
             );
             if row.clicked() {
+                value.clear();
                 changed = true;
             }
 
             for d in &self.input_devices {
-                let mut text = RichText::new(format!(
-                    "{}{}",
-                    d.name,
-                    if d.is_default {
-                        "  (по умолчанию)"
-                    } else {
-                        ""
-                    }
-                ))
-                .size(13.0)
-                .color(p.text);
-                if d.is_default {
-                    text = text.strong();
-                }
-                let mut hover = d.name.clone();
+                let suffix: &[(&str, Color32)] = if d.is_default {
+                    &[("по умолчанию", p.accent)]
+                } else {
+                    &[]
+                };
+                let row = device_row(ui, p, value.as_str() == d.name.as_str(), &d.name, suffix);
                 let sum = d.summary();
-                if !sum.is_empty() {
-                    hover = format!("{} — {sum}", d.name);
-                }
-                let row = ui
-                    .selectable_value(&mut value, d.name.clone(), text)
-                    .on_hover_text(hover);
+                let row = if sum.is_empty() {
+                    row
+                } else {
+                    row.on_hover_text(format!("{} — {sum}", d.name))
+                };
                 if row.clicked() {
+                    value = d.name.clone();
                     changed = true;
                 }
             }
@@ -818,7 +825,7 @@ impl GuiApp {
             );
             ui.label(
                 RichText::new(
-                    "rapcoding ничего не воспроизводит — этот список только для справки. Устройство вывода по умолчанию меняется в Параметры → Система → Звук.",
+                    "rapcoding ничего не воспроизводит — этот список только для справки. Устройство вывода по умолчанию меняется в Параметрах Windows: Система, Звук.",
                 )
                 .size(12.5)
                 .color(p.muted),
@@ -832,24 +839,17 @@ impl GuiApp {
                 );
             }
             for d in &self.output_devices {
-                let mut text = RichText::new(format!(
-                    "{}{}",
-                    d.name,
-                    if d.is_default {
-                        "  (по умолчанию)"
-                    } else {
-                        ""
-                    }
-                ))
-                .size(13.0)
-                .color(p.text);
-                if d.is_default {
-                    text = text.strong();
-                }
+                let suffix: &[(&str, Color32)] = if d.is_default {
+                    &[("по умолчанию", p.accent)]
+                } else {
+                    &[]
+                };
+                // Read-only row: same layout as the input list so long device
+                // names wrap instead of turning into overflow boxes.
+                let row = device_row(ui, p, false, &d.name, suffix);
                 let sum = d.summary();
-                let resp = ui.label(text);
                 if !sum.is_empty() {
-                    resp.on_hover_text(format!("{} — {sum}", d.name));
+                    row.on_hover_text(format!("{} — {sum}", d.name));
                 }
             }
         });
@@ -1417,7 +1417,7 @@ impl GuiApp {
                 );
             }
             ui.label(
-                RichText::new("Папку можно изменить в «Настройки» → «Папка моделей»")
+                RichText::new("Папку можно изменить в «Настройки», раздел «Папка моделей»")
                     .size(12.0)
                     .color(p.muted),
             );
@@ -2173,6 +2173,91 @@ fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) -> std::io::Result
         }
     }
     Ok(())
+}
+
+// ------------------------------------------------------------ sound rows
+
+/// One device row: full-width, wrapped text, readable in every widget state.
+///
+/// Built by hand instead of `ui.selectable_value` because (a) `Button`
+/// truncates by default, so a long Windows endpoint name (70+ chars) turns
+/// into clipping boxes instead of wrapping, and (b) the selected fill must
+/// keep the palette text colour on top (egui uses `selection.stroke` as the
+/// selected text colour, which we set to the text colour in `visuals`).
+fn device_row(
+    ui: &mut egui::Ui,
+    p: Palette,
+    selected: bool,
+    name: &str,
+    suffix: &[(&str, Color32)],
+) -> egui::Response {
+    let width = ui.available_width();
+    // Wrap the long endpoint name instead of truncating it (the "boxes" in the
+    // device lists were clipped glyphs from the default truncating button).
+    let mut job = LayoutJob::default();
+    job.wrap.max_width = (width - 22.0).max(80.0);
+    job.append(
+        name,
+        0.0,
+        TextFormat {
+            font_id: FontId::proportional(13.0),
+            color: p.text,
+            ..Default::default()
+        },
+    );
+    for (label, color) in suffix {
+        job.append(
+            &format!("  {label}"),
+            0.0,
+            TextFormat {
+                font_id: FontId::proportional(11.5),
+                color: *color,
+                ..Default::default()
+            },
+        );
+    }
+    let galley = ui.fonts(|f| f.layout_job(job));
+    // Row height follows the actual galley (one or two lines), + padding.
+    let height = galley.size().y + 14.0;
+    let desired = egui::vec2(width, height);
+    // Predict the hover state cheaply: `interact` needs the rect, and the
+    // background must be painted BEFORE the text, so use the previous frame's
+    // pointer position against the rect we are about to allocate.
+    let mut row_rect = ui.available_rect_before_wrap();
+    row_rect.max.y = row_rect.min.y + height;
+    let hovered = ui
+        .ctx()
+        .pointer_latest_pos()
+        .map_or(false, |p| row_rect.contains(p))
+        && ui.ctx().is_pointer_over_area();
+    let fill = if selected {
+        p.accent.gamma_multiply(0.28)
+    } else if hovered {
+        p.surface
+    } else {
+        Color32::TRANSPARENT
+    };
+    if fill != Color32::TRANSPARENT {
+        ui.painter().rect_filled(row_rect, CornerRadius::same(8), fill);
+    }
+    let inner = ui.allocate_ui(desired, |ui| {
+        ui.set_min_size(desired);
+        ui.add_space(7.0);
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(egui::WidgetText::Galley(galley));
+        });
+        ui.interact(
+            ui.max_rect(),
+            ui.id().with(("device_row", name)),
+            egui::Sense::click(),
+        )
+    });
+    let response = inner.inner;
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 // ------------------------------------------------------------- small views
