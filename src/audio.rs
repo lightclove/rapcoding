@@ -220,9 +220,7 @@ pub fn resolve_input_device(filter: &str) -> Result<cpal::Device> {
     let names: Vec<String> = devices.iter().map(|(_, n)| n.clone()).collect();
     match pick_index(filter, &names) {
         Some(i) => Ok(devices[i].0.clone()),
-        None => Err(Error::Audio(format!(
-            "no input device matching '{filter}'"
-        ))),
+        None => Err(Error::Audio(format!("no input device matching '{filter}'"))),
     }
 }
 
@@ -254,7 +252,10 @@ where
                 // Fallible write: a broken stderr pipe must not panic the audio thread.
                 crate::log::write_line(
                     &mut std::io::stderr(),
-                    &format!("audio stream error: {}", crate::log::sanitize(&e.to_string())),
+                    &format!(
+                        "audio stream error: {}",
+                        crate::log::sanitize(&e.to_string())
+                    ),
                 );
             }
         }
@@ -381,7 +382,10 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        assert_eq!(pick_index("Головной телефон (2- AirPods Pro)", &names), Some(1));
+        assert_eq!(
+            pick_index("Головной телефон (2- AirPods Pro)", &names),
+            Some(1)
+        );
     }
 
     #[test]

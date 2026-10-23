@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use eframe::egui::{self, text::LayoutJob, Color32, CornerRadius, FontId, Margin, RichText, Stroke, TextFormat};
+use eframe::egui::{
+    self, text::LayoutJob, Color32, CornerRadius, FontId, Margin, RichText, Stroke, TextFormat,
+};
 
 use crate::audio;
 use crate::config::{self, Config};
@@ -19,8 +21,8 @@ use crate::error::Result;
 use crate::journal::Journal;
 use crate::log::{self, LiveLog};
 use crate::settings::{
-    self, can_save, draft_check, merge_reload, sync_owned, SettingsDraft,
-    SETTINGS_FIELDS, SETTINGS_SECTIONS,
+    self, can_save, draft_check, merge_reload, sync_owned, SettingsDraft, SETTINGS_FIELDS,
+    SETTINGS_SECTIONS,
 };
 use crate::status::Status;
 use crate::sync;
@@ -202,16 +204,27 @@ impl Page {
 #[derive(Clone, PartialEq, Debug)]
 enum DlState {
     Idle,
-    Downloading { name: String, received: u64, total: u64 },
-    Extracting { name: String },
-    Done { name: String },
+    Downloading {
+        name: String,
+        received: u64,
+        total: u64,
+    },
+    Extracting {
+        name: String,
+    },
+    Done {
+        name: String,
+    },
     Canceled,
     Error(String),
 }
 
 impl DlState {
     fn is_busy(&self) -> bool {
-        matches!(self, DlState::Downloading { .. } | DlState::Extracting { .. })
+        matches!(
+            self,
+            DlState::Downloading { .. } | DlState::Extracting { .. }
+        )
     }
 }
 
@@ -326,7 +339,10 @@ pub fn run(
 /// Initial page, overridable with `RAPCODING_START_PAGE` (design review and
 /// screenshot automation; harmless in normal use).
 fn start_page() -> Page {
-    match std::env::var("RAPCODING_START_PAGE").unwrap_or_default().as_str() {
+    match std::env::var("RAPCODING_START_PAGE")
+        .unwrap_or_default()
+        .as_str()
+    {
         "sound" => Page::Sound,
         "models" => Page::Models,
         "settings" => Page::Settings,
@@ -362,6 +378,11 @@ impl eframe::App for GuiApp {
         let busy = sync::lock_recover(&self.dl_state).is_busy();
         if busy {
             // Repaint while downloading so the progress bar stays live.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        // A hotkey capture must not sit forever waiting for a key: repaint so
+        // the frame state (events consumed, focus lost) keeps up.
+        if self.capture.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -448,12 +469,20 @@ impl GuiApp {
             Status::Idle => (p.success, "Готов", "Жду нажатия хоткея"),
             Status::Listening(l) => (
                 p.success,
-                if *l == "en" { "Слушаю · EN" } else { "Слушаю · RU" },
+                if *l == "en" {
+                    "Слушаю · EN"
+                } else {
+                    "Слушаю · RU"
+                },
                 "Идёт запись — говорите и отпустите хоткей",
             ),
             Status::Transcribing(l) => (
                 p.warn,
-                if *l == "en" { "Распознаю · EN" } else { "Распознаю · RU" },
+                if *l == "en" {
+                    "Распознаю · EN"
+                } else {
+                    "Распознаю · RU"
+                },
                 "Распознавание речи, обычно около секунды",
             ),
             Status::Error(_) => (p.error, "Ошибка", "Подробности — в разделе «Лог»"),
@@ -549,11 +578,7 @@ impl GuiApp {
             });
     }
 
-    fn card<R>(
-        ui: &mut egui::Ui,
-        p: Palette,
-        add: impl FnOnce(&mut egui::Ui) -> R,
-    ) -> R {
+    fn card<R>(ui: &mut egui::Ui, p: Palette, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
         egui::Frame::new()
             .fill(p.surface)
             .stroke(Stroke::new(1.0_f32, p.stroke))
@@ -578,9 +603,11 @@ impl GuiApp {
             ui.label(RichText::new("Диктовка").size(18.0).strong().color(p.text));
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Зажмите хоткей, говорите, отпустите — текст появится в активном окне.")
-                    .size(13.0)
-                    .color(p.muted),
+                RichText::new(
+                    "Зажмите хоткей, говорите, отпустите — текст появится в активном окне.",
+                )
+                .size(13.0)
+                .color(p.muted),
             );
             ui.add_space(14.0);
             egui::Grid::new("hotkeys")
@@ -592,8 +619,18 @@ impl GuiApp {
                     ui.label("");
                     ui.end_row();
                     for (ru, en) in [(&self.cfg.general.hotkey, &self.cfg.general.en_hotkey)] {
-                        ui.label(RichText::new(pretty_hotkey(ru)).monospace().size(14.0).color(p.text));
-                        ui.label(RichText::new(pretty_hotkey(en)).monospace().size(14.0).color(p.text));
+                        ui.label(
+                            RichText::new(pretty_hotkey(ru))
+                                .monospace()
+                                .size(14.0)
+                                .color(p.text),
+                        );
+                        ui.label(
+                            RichText::new(pretty_hotkey(en))
+                                .monospace()
+                                .size(14.0)
+                                .color(p.text),
+                        );
                         ui.label("");
                         ui.end_row();
                     }
@@ -627,10 +664,7 @@ impl GuiApp {
     fn sound(&mut self, ui: &mut egui::Ui, p: Palette) {
         if self.sound_page_dirty {
             self.sound_page_dirty = false;
-            match (
-                audio::list_input_devices(),
-                audio::list_output_devices(),
-            ) {
+            match (audio::list_input_devices(), audio::list_output_devices()) {
                 (Ok(inputs), Ok(outputs)) => {
                     self.input_devices = inputs;
                     self.output_devices = outputs;
@@ -703,7 +737,11 @@ impl GuiApp {
                 let mut text = RichText::new(format!(
                     "{}{}",
                     d.name,
-                    if d.is_default { "  (по умолчанию)" } else { "" }
+                    if d.is_default {
+                        "  (по умолчанию)"
+                    } else {
+                        ""
+                    }
                 ))
                 .size(13.0)
                 .color(p.text);
@@ -797,7 +835,11 @@ impl GuiApp {
                 let mut text = RichText::new(format!(
                     "{}{}",
                     d.name,
-                    if d.is_default { "  (по умолчанию)" } else { "" }
+                    if d.is_default {
+                        "  (по умолчанию)"
+                    } else {
+                        ""
+                    }
                 ))
                 .size(13.0)
                 .color(p.text);
@@ -936,7 +978,9 @@ impl GuiApp {
     /// Validate the draft, sync fields owned by other pages, write atomically,
     /// push the live subset into the daemon, journal the event.
     fn save_settings(&mut self) {
-        let Some(d) = self.settings.as_mut() else { return };
+        let Some(d) = self.settings.as_mut() else {
+            return;
+        };
         if !can_save(d) {
             return;
         }
@@ -958,11 +1002,31 @@ impl GuiApp {
                 }
                 self.cfg = d.cfg.clone();
                 self.theme = Theme::from_config(&self.cfg.gui.theme);
+                // Models folder changed: move installed models if the user
+                // asked for it (default: files stay where they are).
+                if let Some((old_root, new_root)) = d.pending_move.clone() {
+                    let (old_root, new_root) = (
+                        std::path::PathBuf::from(old_root),
+                        std::path::PathBuf::from(new_root),
+                    );
+                    for m in download::MODELS {
+                        let outcome = move_model_dir(&old_root, &new_root, m.name);
+                        self.journal.append(
+                            "download",
+                            &format!(
+                                "models move {} -> {}: {outcome}",
+                                m.name,
+                                new_root.display()
+                            ),
+                        );
+                    }
+                }
                 self.journal.append(
                     "config",
                     &format!("settings saved ({} fields)", SETTINGS_FIELDS.len()),
                 );
                 d.mark_saved();
+                d.move_models = false;
             }
             Err(e) => d.global_error = Some(e.to_string()),
         }
@@ -972,7 +1036,9 @@ impl GuiApp {
     /// draft, adopt the rest. Then the normal save path runs (validate +
     /// atomic write), so nothing invalid or partial reaches the disk.
     fn merge_settings(&mut self) {
-        let Some(d) = self.settings.as_mut() else { return };
+        let Some(d) = self.settings.as_mut() else {
+            return;
+        };
         if let Err(e) = merge_reload(d, &self.config_path) {
             d.global_error = Some(format!("Не удалось объединить: {e}"));
             return;
@@ -1017,8 +1083,9 @@ impl GuiApp {
         ui.horizontal(|ui| {
             // Fixed-width label column keeps the controls aligned; the label
             // is LEFT-aligned (centred labels leave a ragged column).
+            let label_w = SETTINGS_LABEL_WIDTH;
             ui.allocate_ui_with_layout(
-                egui::vec2(210.0, 22.0),
+                egui::vec2(label_w, 22.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     ui.label(RichText::new(meta.label).size(13.0).color(p.text))
@@ -1069,6 +1136,48 @@ impl GuiApp {
                         .add(egui::TextEdit::singleline(v).desired_width(w))
                         .changed();
                 }
+                (WidgetKind::Dir, FieldValue::Str(v)) => {
+                    // Narrow window: text + «Выбрать…» + «Сброс» must fit
+                    // next to the label column (min window is 760 px).
+                    let w = (ui.available_width() - 170.0).clamp(60.0, 320.0);
+                    if ui
+                        .add(egui::TextEdit::singleline(v).desired_width(w))
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui
+                        .button("Выбрать…")
+                        .on_hover_text("Системный диалог выбора папки")
+                        .clicked()
+                    {
+                        let start = if v.trim().is_empty() {
+                            config::config_dir()
+                        } else {
+                            std::path::PathBuf::from(models_root_of(&draft.cfg))
+                        };
+                        let mut dialog = rfd::FileDialog::new()
+                            .set_title("Папка для моделей распознавания");
+                        if start.exists() {
+                            dialog = dialog.set_directory(start);
+                        }
+                        if let Some(picked) = dialog.pick_folder() {
+                            let choice = picked.display().to_string();
+                            if set_models_dir(draft, &choice).is_some() {
+                                changed = true;
+                            }
+                        }
+                    }
+                    if ui
+                        .button("Сброс")
+                        .on_hover_text("Вернуть папку по умолчанию (<config dir>/models)")
+                        .clicked()
+                    {
+                        if set_models_dir(draft, "").is_some() {
+                            changed = true;
+                        }
+                    }
+                }
                 (WidgetKind::Hotkey, FieldValue::Str(v)) => {
                     if *capture == Some(meta.id) {
                         ui.label(
@@ -1114,6 +1223,30 @@ impl GuiApp {
                 badge(ui, "после перезапуска", p.muted);
             }
         });
+        // The models folder row gets a second line (full width) for the move
+        // opt-in, so the button row above stays inside a narrow window.
+        if meta.id == "asr.models_dir" {
+            ui.horizontal(|ui| {
+                ui.add_space(SETTINGS_LABEL_WIDTH + 10.0);
+                if ui
+                    .checkbox(&mut draft.move_models, "Переместить скачанные модели")
+                    .on_hover_text(
+                        "При сохранении перенести уже скачанные модели в новую папку. По умолчанию файлы остаются на месте.",
+                    )
+                    .changed()
+                {
+                    draft.dirty = true;
+                    if draft.move_models {
+                        draft.pending_move = Some((
+                            models_root_of(&draft.baseline).display().to_string(),
+                            models_root_of(&draft.cfg).display().to_string(),
+                        ));
+                    } else {
+                        draft.pending_move = None;
+                    }
+                }
+            });
+        }
         if changed {
             draft.dirty = true;
             draft.errors.clear();
@@ -1156,7 +1289,12 @@ impl GuiApp {
 
     fn help(ui: &mut egui::Ui, p: Palette) {
         Self::card(ui, p, |ui| {
-            ui.label(RichText::new("Как пользоваться").size(18.0).strong().color(p.text));
+            ui.label(
+                RichText::new("Как пользоваться")
+                    .size(18.0)
+                    .strong()
+                    .color(p.text),
+            );
             ui.add_space(10.0);
             let steps = [
                 (
@@ -1257,9 +1395,34 @@ impl GuiApp {
     // -------------------------------------------------------------- models
 
     fn models(&mut self, ui: &mut egui::Ui, p: Palette) {
-        let root = config::config_dir().join("models");
+        let root = config::models_root(&self.cfg, &config::config_dir());
         let state = sync::lock_recover(&self.dl_state).clone();
         let busy = state.is_busy();
+
+        // Where models go (SC-053): shown here because this is where people
+        // look when a download lands somewhere unexpected.
+        Self::card(ui, p, |ui| {
+            Self::section_title(ui, p, "ПАПКА МОДЕЛЕЙ");
+            ui.label(
+                RichText::new(models_dir_display(&self.cfg))
+                    .size(12.5)
+                    .monospace()
+                    .color(p.text),
+            );
+            if !root.exists() {
+                ui.label(
+                    RichText::new("Папки ещё нет — она будет создана при первой загрузке")
+                        .size(12.0)
+                        .color(p.muted),
+                );
+            }
+            ui.label(
+                RichText::new("Папку можно изменить в «Настройки» → «Папка моделей»")
+                    .size(12.0)
+                    .color(p.muted),
+            );
+        });
+        ui.add_space(12.0);
 
         if let Some(err) = &self.delete_error {
             Self::card(ui, p, |ui| {
@@ -1282,9 +1445,11 @@ impl GuiApp {
                     .color(p.text),
             );
             ui.label(
-                RichText::new("Скачайте модель, затем нажмите «Сделать активной» и перезапустите программу.")
-                    .size(12.5)
-                    .color(p.muted),
+                RichText::new(
+                    "Скачайте модель, затем нажмите «Сделать активной» и перезапустите программу.",
+                )
+                .size(12.5)
+                .color(p.muted),
             );
         });
         ui.add_space(12.0);
@@ -1385,9 +1550,11 @@ impl GuiApp {
                         );
                     } else {
                         ui.label(
-                            RichText::new("Будет удалена папка модели — место на диске освободится.")
-                                .size(11.5)
-                                .color(p.muted),
+                            RichText::new(
+                                "Будет удалена папка модели — место на диске освободится.",
+                            )
+                            .size(11.5)
+                            .color(p.muted),
                         );
                     }
                 }
@@ -1406,23 +1573,19 @@ impl GuiApp {
                             // Cap the bar to the visible width: an infinite
                             // desired width overflows the card on Windows.
                             let bar_w = ui.available_width();
-                            ui.add(
-                                egui::ProgressBar::new(frac)
-                                    .desired_width(bar_w)
-                                    .text(format!(
-                                        "{} / {}",
-                                        download::human_size(*received),
-                                        download::human_size(*total)
-                                    )),
-                            );
+                            ui.add(egui::ProgressBar::new(frac).desired_width(bar_w).text(
+                                format!(
+                                    "{} / {}",
+                                    download::human_size(*received),
+                                    download::human_size(*total)
+                                ),
+                            ));
                         }
                         DlState::Extracting { .. } => {
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 ui.add(egui::Spinner::new());
-                                ui.label(
-                                    RichText::new("распаковка…").size(12.5).color(p.muted),
-                                );
+                                ui.label(RichText::new("распаковка…").size(12.5).color(p.muted));
                             });
                         }
                         _ => {}
@@ -1431,7 +1594,12 @@ impl GuiApp {
             });
             ui.add_space(10.0);
 
-            if is_current && matches!(state, DlState::Done { .. } | DlState::Canceled | DlState::Error(_)) {
+            if is_current
+                && matches!(
+                    state,
+                    DlState::Done { .. } | DlState::Canceled | DlState::Error(_)
+                )
+            {
                 break;
             }
         }
@@ -1449,7 +1617,11 @@ impl GuiApp {
             }
             DlState::Canceled => {
                 Self::card(ui, p, |ui| {
-                    ui.label(RichText::new("Скачивание остановлено").size(13.0).color(p.muted));
+                    ui.label(
+                        RichText::new("Скачивание остановлено")
+                            .size(13.0)
+                            .color(p.muted),
+                    );
                 });
             }
             DlState::Error(e) => {
@@ -1573,7 +1745,7 @@ impl GuiApp {
         }
         let state = self.dl_state.clone();
         let journal = self.journal.clone();
-        let root = config::config_dir().join("models");
+        let root = config::models_root(&self.cfg, &config::config_dir());
         let cancel = self.new_cancel_flag();
         self.page = Page::Models;
         journal.append(
@@ -1592,13 +1764,18 @@ impl GuiApp {
                     total: m.size_bytes,
                 });
                 let zip_tmp = root.join(format!("{name}.zip.part"));
-                let result = download::download(m.archive_url(), &zip_tmp, &mut |done, total| {
-                    set(DlState::Downloading {
-                        name: name.clone(),
-                        received: done,
-                        total,
-                    });
-                }, &cancel)
+                let result = download::download(
+                    m.archive_url(),
+                    &zip_tmp,
+                    &mut |done, total| {
+                        set(DlState::Downloading {
+                            name: name.clone(),
+                            received: done,
+                            total,
+                        });
+                    },
+                    &cancel,
+                )
                 .and_then(|()| {
                     set(DlState::Extracting { name: name.clone() });
                     download::extract_zip(&zip_tmp, &root)
@@ -1629,7 +1806,7 @@ impl GuiApp {
     fn start_download(&mut self, m: &'static download::Model) {
         let state = self.dl_state.clone();
         let journal = self.journal.clone();
-        let root = config::config_dir().join("models");
+        let root = config::models_root(&self.cfg, &config::config_dir());
         let name = m.name.to_string();
         let url = m.archive_url();
         let size = m.size_bytes;
@@ -1645,13 +1822,18 @@ impl GuiApp {
                 total: size,
             });
             let zip_tmp = root.join(format!("{name}.zip.part"));
-            let result = download::download(url, &zip_tmp, &mut |done, total| {
-                set(DlState::Downloading {
-                    name: name.clone(),
-                    received: done,
-                    total,
-                });
-            }, &cancel)
+            let result = download::download(
+                url,
+                &zip_tmp,
+                &mut |done, total| {
+                    set(DlState::Downloading {
+                        name: name.clone(),
+                        received: done,
+                        total,
+                    });
+                },
+                &cancel,
+            )
             .and_then(|()| {
                 set(DlState::Extracting { name: name.clone() });
                 download::extract_zip(&zip_tmp, &root)
@@ -1677,7 +1859,7 @@ impl GuiApp {
 
     /// Remove an installed model from disk (with confirmation done in the UI).
     fn delete_model(&mut self, m: &'static download::Model) {
-        let root = config::config_dir().join("models");
+        let root = config::models_root(&self.cfg, &config::config_dir());
         match download::remove_model(&root, m.name) {
             Ok(()) => {
                 self.journal
@@ -1709,6 +1891,10 @@ impl GuiApp {
 
 // ------------------------------------------------------- settings machinery (ui)
 
+/// Width of the settings label column, in points. Also used to indent the
+/// second line of the models-folder row (min window width is 760 px).
+const SETTINGS_LABEL_WIDTH: f32 = 160.0;
+
 /// What a user action on the settings page resolves to (executed after the
 /// render loop so the draft borrow can end first).
 enum SettingsAction {
@@ -1728,8 +1914,10 @@ fn apply_live(shared: &RwLock<Config>, transcripts: &AtomicBool, cfg: &Config) {
 /// True when the file on disk holds values the draft was not based on.
 fn file_changed_externally(d: &SettingsDraft, path: &std::path::Path) -> bool {
     match config::load(path) {
-        Ok(current) if !d.dirty => settings::field_differs(&current, "general.mode", &d.baseline)
-            || settings::external_change(d, &current).is_some(),
+        Ok(current) if !d.dirty => {
+            settings::field_differs(&current, "general.mode", &d.baseline)
+                || settings::external_change(d, &current).is_some()
+        }
         Ok(current) => settings::is_stale(d, &current),
         // An unreadable/invalid file still means "it changed on us".
         Err(_) => true,
@@ -1876,6 +2064,117 @@ fn capture_key(ui: &mut egui::Ui) -> (Option<egui::Key>, egui::Modifiers) {
     out
 }
 
+// ------------------------------------------------------- models root (SC-053)
+
+/// The models root for a config, without touching the filesystem.
+fn models_root_of(cfg: &Config) -> std::path::PathBuf {
+    config::models_root(cfg, &config::config_dir())
+}
+
+/// Human-readable models folder: the configured path, or the platform
+/// default with an explicit marker (so "empty" never looks like a bug).
+fn models_dir_display(cfg: &Config) -> String {
+    if cfg.asr.models_dir.trim().is_empty() {
+        format!("по умолчанию: {}", models_root_of(cfg).display())
+    } else {
+        models_root_of(cfg).display().to_string()
+    }
+}
+
+/// Apply a models-folder change to a draft in place: validate, migrate
+/// active model paths, keep the old root for follow-up bookkeeping (moving
+/// installed model folders) and record the journal note.
+///
+/// Returns the number of model paths that followed the new root; a validation
+/// error is left in `draft.errors` and the draft is not changed.
+fn set_models_dir(draft: &mut SettingsDraft, new_dir: &str) -> Option<(usize, String)> {
+    let trimmed = new_dir.trim();
+    if let Err(e) = config::validate_models_dir(trimmed) {
+        draft.errors.retain(|(id, _)| id != "asr.models_dir");
+        draft.errors.push(("asr.models_dir".into(), e.to_string()));
+        return None;
+    }
+    let old_root = models_root_of(&draft.cfg);
+    draft.cfg.asr.models_dir = trimmed.to_string();
+    let new_root = models_root_of(&draft.cfg);
+    // migrate_model_paths keeps relative values relative; absolute values
+    // inside the old root are rewritten so they follow the new folder.
+    let moved = config::migrate_model_paths(&mut draft.cfg, &old_root, &new_root);
+    // An absolute stored folder switched back to a different one: make the
+    // relative paths absolute again so resolution cannot fall back to the
+    // old default root.
+    for slot in [&mut draft.cfg.asr.model, &mut draft.cfg.asr.en_model] {
+        let p = std::path::Path::new(slot.as_str());
+        if !p.is_absolute() {
+            *slot = new_root.join(p).display().to_string();
+        }
+    }
+    draft.dirty = true;
+    draft.baseline.asr.model = draft.cfg.asr.model.clone();
+    draft.baseline.asr.en_model = draft.cfg.asr.en_model.clone();
+    draft.baseline.asr.models_dir = draft.cfg.asr.models_dir.clone();
+    Some((
+        moved,
+        format!(
+            "models dir -> {} ({} model path(s) followed)",
+            if trimmed.is_empty() {
+                format!("default {}", new_root.display())
+            } else {
+                new_root.display().to_string()
+            },
+            moved
+        ),
+    ))
+}
+
+/// Recursively move an installed model folder from the old root to the new
+/// one. Never overwrites: an existing target is left alone and reported.
+/// Returns "moved", "skipped-exists" or "skipped-absent".
+fn move_model_dir(
+    old_root: &std::path::Path,
+    new_root: &std::path::Path,
+    name: &str,
+) -> &'static str {
+    let from = download::model_dir(old_root, name);
+    let to = download::model_dir(new_root, name);
+    if !from.is_dir() {
+        return "skipped-absent";
+    }
+    if to.exists() {
+        return "skipped-exists";
+    }
+    if let Some(parent) = to.parent() {
+        if let Err(_e) = std::fs::create_dir_all(parent) {
+            return "failed";
+        }
+    }
+    match std::fs::rename(&from, &to) {
+        Ok(()) => "moved",
+        // Cross-device move: fall back to copy + remove.
+        Err(_) => match copy_dir_all(&from, &to) {
+            Ok(()) => {
+                let _ = std::fs::remove_dir_all(&from);
+                "moved"
+            }
+            Err(_) => "failed",
+        },
+    }
+}
+
+fn copy_dir_all(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------- small views
 
 fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -1887,7 +2186,6 @@ fn badge(ui: &mut egui::Ui, text: &str, color: Color32) {
             ui.label(RichText::new(text).size(11.0).color(color).strong());
         });
 }
-
 
 fn model_line(ui: &mut egui::Ui, p: Palette, lang: &str, value: &str) {
     ui.horizontal(|ui| {
@@ -2118,7 +2416,12 @@ mod tests {
 
     #[test]
     fn dl_state_busy() {
-        assert!(DlState::Downloading { name: "x".into(), received: 1, total: 2 }.is_busy());
+        assert!(DlState::Downloading {
+            name: "x".into(),
+            received: 1,
+            total: 2
+        }
+        .is_busy());
         assert!(DlState::Extracting { name: "x".into() }.is_busy());
         assert!(!DlState::Idle.is_busy());
         assert!(!DlState::Canceled.is_busy());
@@ -2160,5 +2463,159 @@ mod tests {
             capture_hotkey(egui::Modifiers::NONE, egui::Key::Escape).as_deref(),
             Some("escape")
         );
+    }
+
+    // ---------------------------------------------------- models dir (SC-053)
+
+    #[test]
+    fn models_dir_display_marks_the_default() {
+        // Arrange.
+        let cfg = Config::default();
+        // Act.
+        let shown = models_dir_display(&cfg);
+        // Assert: an empty setting is explained, not shown as blank.
+        assert!(shown.starts_with("по умолчанию:"), "{shown}");
+        assert!(shown.contains("models"), "{shown}");
+    }
+
+    #[test]
+    fn models_dir_display_shows_a_configured_path() {
+        // Arrange.
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-show-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = dir.display().to_string();
+        // Act.
+        let shown = models_dir_display(&cfg);
+        // Assert.
+        assert!(!shown.contains("по умолчанию"), "{shown}");
+        assert!(shown.contains("rapcoding-md-show"), "{shown}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_models_dir_rejects_a_file_and_keeps_the_draft() {
+        // Arrange: a regular file in place of the folder.
+        let base = std::env::temp_dir().join(format!("rapcoding-md-rej-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let file = base.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let mut d = SettingsDraft::new(&Config::default());
+        let before = d.cfg.clone();
+        // Act.
+        let res = set_models_dir(&mut d, &file.display().to_string());
+        // Assert: loud field error, config unchanged, not marked dirty.
+        assert!(res.is_none());
+        assert_eq!(d.cfg, before);
+        assert!(!d.dirty);
+        assert!(d.errors.iter().any(|(id, _)| id == "asr.models_dir"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn set_models_dir_accepts_an_existing_folder() {
+        // Arrange.
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-acc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut d = SettingsDraft::new(&Config::default());
+        // Act.
+        let res = set_models_dir(&mut d, &dir.display().to_string());
+        // Assert: stored, dirty, journal note mentions the folder.
+        let (_moved, note) = res.expect("valid folder must be accepted");
+        assert_eq!(d.cfg.asr.models_dir, dir.display().to_string());
+        assert!(d.dirty);
+        assert!(note.contains("models dir ->"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_models_dir_pins_relative_model_paths_to_the_new_root() {
+        // Arrange: default relative values; switch to a custom folder.
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut d = SettingsDraft::new(&Config::default());
+        // Act.
+        set_models_dir(&mut d, &dir.display().to_string()).unwrap();
+        // Assert: active models now resolve inside the new folder, not the
+        // old default (which still contains them).
+        let new_root = config::models_root(&d.cfg, &config::config_dir());
+        assert!(std::path::Path::new(&d.cfg.asr.model).is_absolute());
+        assert!(std::path::Path::new(&d.cfg.asr.model).starts_with(&new_root));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_models_dir_back_to_default_restores_relative_paths() {
+        // Arrange: custom folder, then «По умолчанию».
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-back-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut d = SettingsDraft::new(&Config::default());
+        set_models_dir(&mut d, &dir.display().to_string()).unwrap();
+        // Act.
+        set_models_dir(&mut d, "").unwrap();
+        // Assert: empty setting; model paths resolve in the default root.
+        assert_eq!(d.cfg.asr.models_dir, "");
+        let default_root = config::config_dir().join("models");
+        assert!(std::path::Path::new(&d.cfg.asr.model).starts_with(&default_root));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn move_model_dir_moves_an_installed_folder() {
+        // Arrange: a fake model in the old root.
+        let base = std::env::temp_dir().join(format!("rapcoding-md-move-{}", std::process::id()));
+        let old = base.join("old");
+        let new = base.join("new");
+        std::fs::create_dir_all(old.join("m1")).unwrap();
+        std::fs::write(old.join("m1").join("am.bin"), b"model-bytes").unwrap();
+        // Act.
+        let outcome = move_model_dir(&old, &new, "m1");
+        // Assert: moved, content intact, source gone.
+        assert_eq!(outcome, "moved");
+        assert_eq!(
+            std::fs::read(new.join("m1").join("am.bin")).unwrap(),
+            b"model-bytes"
+        );
+        assert!(!old.join("m1").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_model_dir_never_overwrites_an_existing_target() {
+        // Arrange: both roots already hold a folder with that name.
+        let base = std::env::temp_dir().join(format!("rapcoding-md-clash-{}", std::process::id()));
+        let old = base.join("old");
+        let new = base.join("new");
+        std::fs::create_dir_all(old.join("m1")).unwrap();
+        std::fs::create_dir_all(new.join("m1")).unwrap();
+        std::fs::write(new.join("m1").join("keep"), b"keep").unwrap();
+        // Act.
+        let outcome = move_model_dir(&old, &new, "m1");
+        // Assert: target untouched, source intact, reported as skipped.
+        assert_eq!(outcome, "skipped-exists");
+        assert_eq!(std::fs::read(new.join("m1").join("keep")).unwrap(), b"keep");
+        assert!(old.join("m1").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_model_dir_reports_a_missing_source() {
+        // Arrange: nothing installed.
+        let base = std::env::temp_dir().join(format!("rapcoding-md-absent-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        // Act.
+        let outcome = move_model_dir(&base.join("old"), &base.join("new"), "nope");
+        // Assert.
+        assert_eq!(outcome, "skipped-absent");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_models_flag_is_off_by_default() {
+        // Arrange/Act: a fresh draft must not promise a move.
+        let d = SettingsDraft::new(&Config::default());
+        // Assert: files stay put unless the user opts in.
+        assert!(!d.move_models);
+        assert!(d.pending_move.is_none());
     }
 }

@@ -21,12 +21,7 @@ impl Journal {
     /// Append one event (best-effort: a journal failure must never break the
     /// daemon). Messages are sanitized so they stay on a single line.
     pub fn append(&self, kind: &str, msg: &str) {
-        let line = format!(
-            "[{}] {} {}",
-            timestamp(),
-            kind,
-            crate::log::sanitize(msg)
-        );
+        let line = format!("[{}] {} {}", timestamp(), kind, crate::log::sanitize(msg));
         if let Some(p) = self.path.parent() {
             let _ = fs::create_dir_all(p);
         }

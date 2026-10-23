@@ -16,10 +16,18 @@ use crate::hotkey;
 pub enum WidgetKind {
     Bool,
     Choice(&'static [&'static str]),
-    Float { min: f32, max: f32 },
-    UInt { min: u64, max: u64 },
+    Float {
+        min: f32,
+        max: f32,
+    },
+    UInt {
+        min: u64,
+        max: u64,
+    },
     Text,
     Hotkey,
+    /// Filesystem directory; rendered as a text field + «Выбрать…» dialog.
+    Dir,
 }
 
 /// Declarative mapping config field -> UI control. `id` must equal the
@@ -48,6 +56,7 @@ pub const SETTINGS_FIELDS: &[FieldMeta] = &[
     FieldMeta { id: "audio.min_speech_ms", label: "Минимум речи, мс", hint: "Более короткие звуки отбрасываются как шум", kind: WidgetKind::UInt { min: 0, max: 60000 }, restart: false },
     FieldMeta { id: "asr.model", label: "Модель (русский)", hint: "Путь к распакованной модели; активация — на странице «Модели»", kind: WidgetKind::Text, restart: true },
     FieldMeta { id: "asr.en_model", label: "Модель (английский)", hint: "Загружается при первом использовании английского хоткея", kind: WidgetKind::Text, restart: true },
+    FieldMeta { id: "asr.models_dir", label: "Папка моделей", hint: "Куда скачивать модели. Пусто — по умолчанию (<config dir>/models). Выбор — кнопкой «Выбрать…»", kind: WidgetKind::Dir, restart: true },
     FieldMeta { id: "text.voice_commands", label: "Голосовые команды", hint: "off — выключены; safe — многословные; aggressive — + однословные", kind: WidgetKind::Choice(&["off", "safe", "aggressive"]), restart: false },
     FieldMeta { id: "text.remove_sound_tags", label: "Убирать звуковые теги", hint: "[звук], [шум] и т.п. удаляются из текста", kind: WidgetKind::Bool, restart: false },
     FieldMeta { id: "text.strip_punctuation", label: "Убирать пунктуацию", hint: "Только слова: точки, запятые, кавычки удаляются", kind: WidgetKind::Bool, restart: false },
@@ -96,6 +105,7 @@ pub fn field_mut<'a>(cfg: &'a mut Config, id: &str) -> Option<FieldValue<'a>> {
         "audio.min_speech_ms" => FieldValue::U32(&mut cfg.audio.min_speech_ms),
         "asr.model" => FieldValue::Str(&mut cfg.asr.model),
         "asr.en_model" => FieldValue::Str(&mut cfg.asr.en_model),
+        "asr.models_dir" => FieldValue::Str(&mut cfg.asr.models_dir),
         "text.voice_commands" => FieldValue::Str(&mut cfg.text.voice_commands),
         "text.remove_sound_tags" => FieldValue::Bool(&mut cfg.text.remove_sound_tags),
         "text.strip_punctuation" => FieldValue::Bool(&mut cfg.text.strip_punctuation),
@@ -126,6 +136,11 @@ pub struct SettingsDraft {
     pub stale: bool,
     /// What the file was last known to contain.
     pub baseline: Config,
+    /// UI state of the models-folder row (persisted in nothing: it is a
+    /// one-shot user choice for the next save).
+    pub move_models: bool,
+    /// (old_root, new_root) to move installed models between, after save.
+    pub pending_move: Option<(String, String)>,
 }
 
 impl SettingsDraft {
@@ -138,6 +153,8 @@ impl SettingsDraft {
             fresh: false,
             stale: false,
             baseline: cfg.clone(),
+            move_models: false,
+            pending_move: None,
         }
     }
 
@@ -149,6 +166,7 @@ impl SettingsDraft {
         self.fresh = false;
         self.stale = false;
         self.baseline = self.cfg.clone();
+        self.pending_move = None;
     }
 }
 
@@ -294,7 +312,10 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("rapcoding-settings-{}-{name}.toml", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "rapcoding-settings-{}-{name}.toml",
+            std::process::id()
+        ))
     }
 
     #[test]
@@ -320,7 +341,10 @@ mod tests {
         let meta: std::collections::BTreeSet<String> =
             SETTINGS_FIELDS.iter().map(|m| m.id.to_string()).collect();
         // Assert: the UI mapping equals the schema exactly (no drift).
-        assert_eq!(keys, meta, "settings UI must map every config key exactly once");
+        assert_eq!(
+            keys, meta,
+            "settings UI must map every config key exactly once"
+        );
     }
 
     #[test]

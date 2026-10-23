@@ -174,8 +174,7 @@ trait KeySink {
 
 impl KeySink for Enigo {
     fn key(&mut self, key: Key, direction: Direction) -> Result<()> {
-        Keyboard::key(self, key, direction)
-            .map_err(|err| Error::Inject(format!("keyboard: {err}")))
+        Keyboard::key(self, key, direction).map_err(|err| Error::Inject(format!("keyboard: {err}")))
     }
 }
 
@@ -284,7 +283,12 @@ mod tests {
 
     #[test]
     fn send_chord_releases_modifiers_on_success() {
-        let mut sink = MockSink { pressed: 0, released: 0, fail_on: None, calls: 0 };
+        let mut sink = MockSink {
+            pressed: 0,
+            released: 0,
+            fail_on: None,
+            calls: 0,
+        };
         assert!(send_chord(&mut sink, chord(true, true)).is_ok());
         assert_eq!(sink.pressed, 2);
         assert_eq!(sink.released, 2, "every pressed modifier must be released");
@@ -294,7 +298,12 @@ mod tests {
     fn send_chord_releases_modifiers_on_failure() {
         // ctrl+shift+v: calls are [ctrl press, shift press, v click, …].
         // Fail on the click (3rd call) — both modifiers must still be released.
-        let mut sink = MockSink { pressed: 0, released: 0, fail_on: Some(3), calls: 0 };
+        let mut sink = MockSink {
+            pressed: 0,
+            released: 0,
+            fail_on: Some(3),
+            calls: 0,
+        };
         assert!(send_chord(&mut sink, chord(true, true)).is_err());
         assert_eq!(
             sink.pressed, sink.released,

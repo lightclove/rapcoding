@@ -84,7 +84,12 @@ impl Logger {
             return;
         }
         let secs = inner.start.elapsed().as_secs_f64();
-        let line = format!("[{:>9.3}s] {:<5} {}", secs, level_name(level), sanitize(msg));
+        let line = format!(
+            "[{:>9.3}s] {:<5} {}",
+            secs,
+            level_name(level),
+            sanitize(msg)
+        );
         write_line(&mut std::io::stderr(), &line);
         if let Some(live) = &inner.live {
             live.push(&line);
@@ -185,7 +190,10 @@ impl LiveLog {
     /// Oldest-first snapshot of the buffered lines.
     #[cfg(feature = "gui")]
     pub fn snapshot(&self) -> Vec<String> {
-        crate::sync::lock_recover(&self.inner).iter().cloned().collect()
+        crate::sync::lock_recover(&self.inner)
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -217,7 +225,10 @@ mod tests {
             live: None,
         };
         inner.rotate_if_needed().unwrap();
-        assert!(path.exists(), "current log must be recreated after rotation");
+        assert!(
+            path.exists(),
+            "current log must be recreated after rotation"
+        );
         assert!(
             dir.join("rapcoding.log.1").exists(),
             "old log must be rotated away"
@@ -254,7 +265,10 @@ mod tests {
         }));
         logger.info("after poison");
         let content = fs::read_to_string(&path).unwrap_or_default();
-        assert!(content.contains("after poison"), "log must recover from a poisoned mutex");
+        assert!(
+            content.contains("after poison"),
+            "log must recover from a poisoned mutex"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -273,7 +287,11 @@ mod tests {
         .unwrap();
         logger.info("line1\nline2\x1b[31mRED\tend");
         let content = fs::read_to_string(&path).unwrap_or_default();
-        assert_eq!(content.lines().count(), 1, "one log entry = one line (no raw newline)");
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "one log entry = one line (no raw newline)"
+        );
         assert!(!content.contains('\x1b'), "no raw escape sequences");
         assert!(content.contains("\\n"), "newline must be escaped");
         assert!(content.contains("\\x1b"), "escape must be hex-escaped");
@@ -331,7 +349,10 @@ mod tests {
         logger.transcript("SECRET");
         // Assert.
         let content = fs::read_to_string(&path).unwrap_or_default();
-        assert!(!content.contains("SECRET"), "transcripts must not be logged when disabled");
+        assert!(
+            !content.contains("SECRET"),
+            "transcripts must not be logged when disabled"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -353,7 +374,10 @@ mod tests {
         logger.transcript("HELLO");
         // Assert.
         let content = fs::read_to_string(&path).unwrap_or_default();
-        assert!(content.contains("HELLO"), "transcripts must be logged when enabled");
+        assert!(
+            content.contains("HELLO"),
+            "transcripts must be logged when enabled"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -365,8 +389,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rapcoding.log");
         let flag = Arc::new(AtomicBool::new(true));
-        let logger =
-            Logger::new_with_live(path.clone(), Level::Info, flag.clone(), None).unwrap();
+        let logger = Logger::new_with_live(path.clone(), Level::Info, flag.clone(), None).unwrap();
         // Act 1: disable at runtime — must take effect immediately.
         flag.store(false, Ordering::Relaxed);
         logger.transcript("SECRET");

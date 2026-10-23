@@ -30,8 +30,7 @@ impl Model {
 
     /// URL of the zip archive for this model.
     pub fn archive_url(&self) -> &'static str {
-        format!("{}/{}.zip", MIRROR_BASE, self.name)
-            .leak()
+        format!("{}/{}.zip", MIRROR_BASE, self.name).leak()
     }
 }
 
@@ -253,15 +252,16 @@ mod tests {
 
     #[test]
     fn config_value_is_models_prefix() {
-        assert_eq!(
-            MODELS[0].config_value(),
-            "models/vosk-model-small-ru-0.22"
-        );
+        assert_eq!(MODELS[0].config_value(), "models/vosk-model-small-ru-0.22");
     }
 
     #[test]
     fn catalog_entries_are_complete() {
-        assert_eq!(MODELS.len(), 4, "catalog must stay in sync with the release");
+        assert_eq!(
+            MODELS.len(),
+            4,
+            "catalog must stay in sync with the release"
+        );
         for m in MODELS {
             assert!(!m.name.is_empty());
             assert!(m.lang == "ru" || m.lang == "en");
@@ -306,7 +306,10 @@ mod tests {
         let out = dir.join("out");
         extract_zip(&zip_path, &out).unwrap();
         assert_eq!(fs::read_to_string(out.join("m/a.txt")).unwrap(), "hello");
-        assert_eq!(fs::read_to_string(out.join("m/sub/b.txt")).unwrap(), "world");
+        assert_eq!(
+            fs::read_to_string(out.join("m/sub/b.txt")).unwrap(),
+            "world"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

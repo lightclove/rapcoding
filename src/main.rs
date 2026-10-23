@@ -253,7 +253,16 @@ fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
             journal.append("session", &format!("daemon failed: {msg}"));
         }
     }
-    gui::run(cfg, path, status, live, journal, shared_cfg, transcripts, verbose)
+    gui::run(
+        cfg,
+        path,
+        status,
+        live,
+        journal,
+        shared_cfg,
+        transcripts,
+        verbose,
+    )
 }
 
 /// Everything the recognition loop needs. Setup runs synchronously so early
@@ -292,7 +301,10 @@ impl Daemon {
         let level = if verbose { Level::Debug } else { Level::Info };
         let log_path = config::config_dir().join("rapcoding.log");
         let logger = Logger::new_with_live(log_path, level, transcripts, live)?;
-        logger.info(&format!("rapcoding {VERSION} starting; config {}", path.display()));
+        logger.info(&format!(
+            "rapcoding {VERSION} starting; config {}",
+            path.display()
+        ));
         journal.append("session", &format!("start; config {}", path.display()));
 
         let mode = parse_mode(&init.general.mode)?;
@@ -305,13 +317,24 @@ impl Daemon {
         ));
 
         let base_dir = config_dir_of(path);
-        let model_dir = config::resolve_model_path(&base_dir, &init.asr.model);
-        let en_model_dir = config::resolve_model_path(&base_dir, &init.asr.en_model);
+        let model_dir = config::resolve_model_path_in(
+            &config::models_root(&init, &base_dir),
+            &base_dir,
+            &init.asr.model,
+        );
+        let en_model_dir = config::resolve_model_path_in(
+            &config::models_root(&init, &base_dir),
+            &base_dir,
+            &init.asr.en_model,
+        );
         let asr = asr::VoskAsr::new(&model_dir)?;
         if let Err(e) = asr.check() {
             logger.warn(&format!("asr not ready: {e} (recognition will fail)"));
         }
-        logger.debug(&format!("asr: model={} en_model={}", init.asr.model, init.asr.en_model));
+        logger.debug(&format!(
+            "asr: model={} en_model={}",
+            init.asr.model, init.asr.en_model
+        ));
         let injector = inject::Injector::new(
             init.inject.enabled,
             &init.inject.method,
@@ -324,7 +347,10 @@ impl Daemon {
         let bindings = vec![init.general.hotkey.clone(), init.general.en_hotkey.clone()];
         let hotkeys = hotkey::spawn_hotkeys(&bindings, hot_tx)?;
         for b in &bindings {
-            logger.info(&format!("hotkey '{b}' registered (mode {})", init.general.mode));
+            logger.info(&format!(
+                "hotkey '{b}' registered (mode {})",
+                init.general.mode
+            ));
         }
 
         let (work_tx, work_rx) = mpsc::channel::<WorkResult>();
@@ -356,7 +382,8 @@ impl Daemon {
         }
         self.busy.store(true, Ordering::Relaxed);
         self.set_status(Status::Transcribing(lang.name()));
-        self.logger.info(&format!("transcribing… ({})", lang.name()));
+        self.logger
+            .info(&format!("transcribing… ({})", lang.name()));
         // Snapshot the shared config: the live subset edited in the settings
         // page (text.*, audio thresholds) takes effect on the next utterance.
         let cfg = sync::read_recover(&self.cfg).clone();
@@ -394,7 +421,8 @@ impl Daemon {
                                 self.audio.start();
                                 recording = Some(id);
                                 self.set_status(Status::Listening(Lang::of(id).name()));
-                                self.logger.info(&format!("listening ({})", Lang::of(id).name()));
+                                self.logger
+                                    .info(&format!("listening ({})", Lang::of(id).name()));
                             }
                         }
                         (Mode::Hold, hotkey::HotEvent::Released) => {
@@ -414,7 +442,8 @@ impl Daemon {
                                 self.audio.start();
                                 recording = Some(id);
                                 self.set_status(Status::Listening(Lang::of(id).name()));
-                                self.logger.info(&format!("listening ({})", Lang::of(id).name()));
+                                self.logger
+                                    .info(&format!("listening ({})", Lang::of(id).name()));
                             }
                         }
                         (_, hotkey::HotEvent::Released) => {}
@@ -686,7 +715,11 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
         }
     }
 
-    match asr::VoskAsr::new(&config::resolve_model_path(&base_dir, &cfg.asr.model)) {
+    match asr::VoskAsr::new(&config::resolve_model_path_in(
+        &config::models_root(&cfg, &base_dir),
+        &base_dir,
+        &cfg.asr.model,
+    )) {
         Ok(a) => match a.check() {
             Ok(()) => println!("  ok: asr model '{}' present", cfg.asr.model),
             Err(e) => {
@@ -700,7 +733,11 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
         }
     }
 
-    match asr::VoskAsr::new(&config::resolve_model_path(&base_dir, &cfg.asr.en_model)) {
+    match asr::VoskAsr::new(&config::resolve_model_path_in(
+        &config::models_root(&cfg, &base_dir),
+        &base_dir,
+        &cfg.asr.en_model,
+    )) {
         Ok(a) => match a.check() {
             Ok(()) => println!("  ok: asr en_model '{}' present", cfg.asr.en_model),
             Err(e) => {
@@ -768,7 +805,11 @@ fn cmd_transcribe(override_path: Option<&Path>, wav: &Path) -> Result<i32> {
     let path = config::config_path(override_path);
     let cfg = config::load(&path)?;
     let base_dir = config_dir_of(&path);
-    let model_dir = config::resolve_model_path(&base_dir, &cfg.asr.model);
+    let model_dir = config::resolve_model_path_in(
+        &config::models_root(&cfg, &base_dir),
+        &base_dir,
+        &cfg.asr.model,
+    );
     let asr = asr::VoskAsr::new(&model_dir)?;
     asr.check()?;
     println!("transcribing {} …", wav.display());
@@ -799,7 +840,7 @@ fn cmd_inject(override_path: Option<&Path>, text: &str) -> Result<i32> {
     Ok(0)
 }
 
-fn config_dir_of(path: &Path) -> PathBuf {
+pub(crate) fn config_dir_of(path: &Path) -> PathBuf {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => config::config_dir(),

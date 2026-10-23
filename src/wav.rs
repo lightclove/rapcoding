@@ -189,7 +189,10 @@ mod tests {
         b[40..44].copy_from_slice(&declared);
         let p = std::env::temp_dir().join("rapc-truncated.wav");
         std::fs::write(&p, &b).unwrap();
-        assert!(read_wav(&p).is_err(), "truncated data chunk must be rejected");
+        assert!(
+            read_wav(&p).is_err(),
+            "truncated data chunk must be rejected"
+        );
         let _ = std::fs::remove_file(&p);
     }
 
@@ -200,7 +203,10 @@ mod tests {
         b[23] = 0;
         let p = std::env::temp_dir().join("rapc-channels.wav");
         std::fs::write(&p, &b).unwrap();
-        assert!(read_wav(&p).is_err(), "absurd channel count must be rejected");
+        assert!(
+            read_wav(&p).is_err(),
+            "absurd channel count must be rejected"
+        );
         let _ = std::fs::remove_file(&p);
     }
 }

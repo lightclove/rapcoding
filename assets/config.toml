@@ -16,8 +16,9 @@ silence_padding_ms = 200   # silence kept around detected speech
 min_speech_ms = 250        # reject shorter utterances as noise
 
 [asr]
-model = "models/vosk-model-small-ru-0.22"  # relative to config dir, exe dir, or cwd (unpacked model dir)
+model = "models/vosk-model-small-ru-0.22"  # relative to config dir, default config dir, exe dir, or cwd (unpacked model dir)
 en_model = "models/vosk-model-small-en-us-0.15"  # model for en_hotkey (loaded on first use)
+models_dir = ""            # empty = platform default (<config dir>/models); absolute path to store downloaded models
 
 [text]
 voice_commands = "safe"    # "off" | "safe" (multi-word) | "aggressive" (adds single-word)

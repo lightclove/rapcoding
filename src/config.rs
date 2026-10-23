@@ -47,6 +47,10 @@ pub struct Audio {
 pub struct Asr {
     pub model: String,
     pub en_model: String,
+    /// Where downloaded models live. Empty = the platform default
+    /// (`config_dir/models`), so configs written before SC-053 keep working.
+    /// An absolute path is stored as chosen by the user.
+    pub models_dir: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -116,6 +120,7 @@ impl Default for Asr {
         Asr {
             model: "models/vosk-model-small-ru-0.22".into(),
             en_model: "models/vosk-model-small-en-us-0.15".into(),
+            models_dir: String::new(),
         }
     }
 }
@@ -154,6 +159,7 @@ impl Default for Gui {
 impl Config {
     /// Semantic validation beyond serde's shape checks.
     pub fn validate(&self) -> Result<()> {
+        validate_models_dir(&self.asr.models_dir)?;
         if !matches!(self.general.mode.as_str(), "hold" | "toggle") {
             return Err(Error::Config(format!(
                 "general.mode must be 'hold' or 'toggle', got '{}'",
@@ -183,9 +189,7 @@ impl Config {
             ));
         }
         if self.audio.min_speech_ms > 60_000 {
-            return Err(Error::Config(
-                "audio.min_speech_ms must be <= 60000".into(),
-            ));
+            return Err(Error::Config("audio.min_speech_ms must be <= 60000".into()));
         }
         if !matches!(
             self.text.voice_commands.as_str(),
@@ -289,36 +293,185 @@ pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     let write_result = std::fs::write(&tmp, s);
     if let Err(e) = &write_result {
         let _ = std::fs::remove_file(&tmp);
-        return Err(Error::Config(format!(
-            "write {}: {e}",
-            tmp.display()
-        )));
+        return Err(Error::Config(format!("write {}: {e}", tmp.display())));
     }
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        Error::Config(format!("rename {} -> {}: {e}", tmp.display(), path.display()))
+        Error::Config(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
     })?;
     Ok(())
 }
 
-/// Resolve a relative path (e.g. the model) against config dir, cwd, then exe dir.
-pub fn resolve_model_path(cfg_dir: &Path, rel: &str) -> PathBuf {
+/// Resolve a relative path (e.g. the model) against the models root, config
+/// dir, default config dir (installed models), cwd, then exe dir.
+/// `models_root` comes from [`models_root`], so a relative `models/<name>`
+/// follows the configured folder (and falls back to the platform default when
+/// it is empty).
+pub fn resolve_model_path_in(models_root: &Path, cfg_dir: &Path, rel: &str) -> PathBuf {
     let p = Path::new(rel);
     if p.is_absolute() {
         return p.to_path_buf();
     }
-    let mut candidates: Vec<PathBuf> = vec![cfg_dir.join(p), PathBuf::from(p)];
+    for c in model_candidates(models_root, cfg_dir, &config_dir(), rel) {
+        if c.exists() {
+            return c.clone();
+        }
+    }
+    // Nothing exists yet: return where a download would put the model, never
+    // the doubled-prefix form (`models/models/...`).
+    match p.strip_prefix("models") {
+        Ok(s) if !s.as_os_str().is_empty() => models_root.join(s),
+        _ => models_root.join(p),
+    }
+}
+
+/// Candidate locations for a relative model path, in priority order: models
+/// root, config dir, default config dir (installed models must stay reachable
+/// when the config lives elsewhere, e.g. `--config` pointing at a temp copy),
+/// cwd, then exe dir.
+fn model_candidates(
+    models_root: &Path,
+    cfg_dir: &Path,
+    default_dir: &Path,
+    rel: &str,
+) -> Vec<PathBuf> {
+    let p = Path::new(rel);
+    // A config value may already carry the `models/` prefix; joining it onto
+    // the models root would produce `models/models/...`.
+    let stripped = p
+        .strip_prefix("models")
+        .ok()
+        .filter(|s| !s.as_os_str().is_empty());
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(s) = stripped {
+        candidates.push(models_root.join(s));
+    }
+    candidates.push(models_root.join(p));
+    candidates.push(cfg_dir.join(p));
+    if default_dir != cfg_dir {
+        // With and without the `models/` prefix, to cover both conventions.
+        candidates.push(default_dir.join(p));
+        candidates.push(default_dir.join("models").join(p));
+    }
+    candidates.push(PathBuf::from(p));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join(p));
         }
     }
-    for c in &candidates {
-        if c.exists() {
-            return c.clone();
+    candidates
+}
+
+/// The models root as an absolute path: `asr.models_dir` when set, else the
+/// platform default `<config_dir>/models`. A relative `models_dir` is taken
+/// relative to the config dir (never to cwd: the GUI may be started from
+/// anywhere), then normalised to an absolute path.
+pub fn models_root(cfg: &Config, cfg_dir: &Path) -> PathBuf {
+    let configured = cfg.asr.models_dir.trim();
+    if configured.is_empty() {
+        return cfg_dir.join("models");
+    }
+    let p = Path::new(configured);
+    if p.is_absolute() {
+        return normalise(p);
+    }
+    normalise(&cfg_dir.join(p))
+}
+
+/// Lexical normalisation: drop `.` and resolve `..` without touching the FS.
+fn normalise(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
         }
     }
-    cfg_dir.join(p)
+    out
+}
+
+/// Validate a models directory path before it is written to the config.
+///
+/// An empty value is always valid (= platform default). Otherwise the path
+/// must be *creatable* as a directory: an existing directory, or a path whose
+/// nearest existing ancestor is a directory (the folder itself is created on
+/// first download). A regular file in the way is rejected loudly instead of
+/// failing later at download time.
+///
+/// A vanished folder (unplugged drive, deleted cache) is NOT an error here:
+/// the stored choice must survive restarts and the app must still start.
+/// Availability is a runtime check (`models_root().exists()`), not a config
+/// contract.
+pub fn validate_models_dir(path: &str) -> Result<()> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let p = PathBuf::from(trimmed);
+    if p.exists() {
+        if !p.is_dir() {
+            return Err(Error::Config(format!(
+                "asr.models_dir '{trimmed}' is a file, not a directory"
+            )));
+        }
+        return Ok(());
+    }
+    // Not present yet: the nearest existing ancestor must be a directory.
+    let mut anc = p.as_path();
+    while let Some(parent) = anc.parent() {
+        anc = parent;
+        if anc.as_os_str().is_empty() {
+            break;
+        }
+        if anc.exists() {
+            if !anc.is_dir() {
+                return Err(Error::Config(format!(
+                    "asr.models_dir '{trimmed}': '{}' is not a directory",
+                    anc.display()
+                )));
+            }
+            return Ok(());
+        }
+    }
+    Err(Error::Config(format!(
+        "asr.models_dir '{trimmed}': no existing parent directory"
+    )))
+}
+
+/// Rewrite relative model paths (`models/<name>`) for a models-root change.
+///
+/// Active models whose value points inside the *old default* root stay
+/// relative (`models/<name>`) and therefore follow the new folder; custom
+/// absolute paths are left untouched (the user owns them). Returns the
+/// number of rewritten entries.
+pub fn migrate_model_paths(cfg: &mut Config, old_root: &Path, new_root: &Path) -> usize {
+    if old_root == new_root {
+        return 0;
+    }
+    let mut changed = 0;
+    let old = normalise(old_root);
+    for slot in [&mut cfg.asr.model, &mut cfg.asr.en_model] {
+        let p = Path::new(slot.as_str());
+        if !p.is_absolute() {
+            continue;
+        }
+        if let Ok(rel) = p.strip_prefix(&old) {
+            if !rel.as_os_str().is_empty() {
+                *slot = format!("models/{}", rel.display());
+                changed += 1;
+            }
+        }
+    }
+    let _ = new_root;
+    changed
 }
 
 #[cfg(test)]
@@ -329,6 +482,292 @@ mod tests {
     fn embedded_template_matches_default() {
         let parsed: Config = toml::from_str(DEFAULT_CONFIG).expect("template must parse");
         assert_eq!(parsed, Config::default());
+    }
+
+    #[test]
+    fn models_dir_defaults_to_empty() {
+        assert_eq!(Config::default().asr.models_dir, "");
+    }
+
+    #[test]
+    fn legacy_config_without_models_dir_parses() {
+        // Arrange: a config written before SC-053 (no models_dir key).
+        let s = "[asr]\nmodel = \"models/x\"\nen_model = \"models/y\"\n";
+        // Act.
+        let cfg: Config = toml::from_str(s).unwrap();
+        // Assert: default (empty) and valid.
+        assert_eq!(cfg.asr.models_dir, "");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn models_root_defaults_to_config_dir_models() {
+        // Arrange.
+        let cfg = Config::default();
+        let dir = Path::new("C:\\cfg");
+        // Act.
+        let root = models_root(&cfg, dir);
+        // Assert.
+        assert_eq!(root, dir.join("models"));
+    }
+
+    #[test]
+    fn models_root_uses_absolute_setting() {
+        // Arrange.
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = "D:\\Models".into();
+        // Act.
+        let root = models_root(&cfg, Path::new("C:\\cfg"));
+        // Assert: the user's choice wins.
+        assert_eq!(root, PathBuf::from("D:\\Models"));
+    }
+
+    #[test]
+    fn models_root_resolves_relative_against_config_dir() {
+        // Arrange: a relative setting must never depend on the process cwd.
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = "my-models".into();
+        // Act.
+        let root = models_root(&cfg, Path::new("C:\\cfg"));
+        // Assert.
+        assert_eq!(root, Path::new("C:\\cfg").join("my-models"));
+    }
+
+    #[test]
+    fn models_root_normalises_dots() {
+        // Arrange.
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = "C:\\cfg\\a\\..\\models".into();
+        // Act.
+        let root = models_root(&cfg, Path::new("C:\\cfg"));
+        // Assert.
+        assert_eq!(root, PathBuf::from("C:\\cfg\\models"));
+    }
+
+    #[test]
+    fn validate_models_dir_accepts_empty_and_existing_dir() {
+        // Arrange.
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Act/Assert.
+        assert!(validate_models_dir("").is_ok());
+        assert!(validate_models_dir("   ").is_ok(), "whitespace = default");
+        assert!(validate_models_dir(&dir.display().to_string()).is_ok());
+        // A non-existent child of an existing dir is fine (created later).
+        let child = dir.join("models-here");
+        assert!(validate_models_dir(&child.display().to_string()).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_models_dir_rejects_file_in_the_way() {
+        // Arrange: a regular file where the folder should be.
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        // Act.
+        let res = validate_models_dir(&file.display().to_string());
+        // Assert: loud error naming the field.
+        let msg = res
+            .expect_err("file as models_dir must be rejected")
+            .to_string();
+        assert!(msg.contains("asr.models_dir"), "{msg}");
+        assert!(
+            msg.contains("not a directory") || msg.contains("is a file"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_models_dir_fails_validation() {
+        // Arrange.
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-val-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f");
+        std::fs::write(&file, b"x").unwrap();
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = file.display().to_string();
+        // Act.
+        let res = cfg.validate();
+        // Assert.
+        assert!(res.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_models_dir_passes_validation() {
+        // Arrange.
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = dir.display().to_string();
+        // Act/Assert.
+        assert!(cfg.validate().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_keeps_relative_paths_and_touches_nothing() {
+        // Arrange: default relative values.
+        let mut cfg = Config::default();
+        let before = cfg.clone();
+        // Act.
+        let n = migrate_model_paths(&mut cfg, Path::new("C:\\cfg\\models"), Path::new("D:\\m"));
+        // Assert: already relative -> follow the new root by themselves.
+        assert_eq!(n, 0);
+        assert_eq!(cfg, before);
+    }
+
+    #[test]
+    fn migrate_rewrites_absolute_paths_inside_old_root() {
+        // Arrange: the user had picked an absolute path inside the default root.
+        let mut cfg = Config::default();
+        cfg.asr.model = "C:\\cfg\\models\\vosk-ru".into();
+        cfg.asr.en_model = "C:\\cfg\\models\\vosk-en".into();
+        // Act.
+        let n = migrate_model_paths(&mut cfg, Path::new("C:\\cfg\\models"), Path::new("D:\\m"));
+        // Assert: rewritten to relative -> resolved in the new folder.
+        assert_eq!(n, 2);
+        assert_eq!(cfg.asr.model, "models/vosk-ru");
+        assert_eq!(cfg.asr.en_model, "models/vosk-en");
+    }
+
+    #[test]
+    fn migrate_leaves_custom_absolute_paths_alone() {
+        // Arrange: a model outside the old root is the user's business.
+        let mut cfg = Config::default();
+        cfg.asr.model = "E:\\other\\model".into();
+        // Act.
+        let n = migrate_model_paths(&mut cfg, Path::new("C:\\cfg\\models"), Path::new("D:\\m"));
+        // Assert.
+        assert_eq!(n, 0);
+        assert_eq!(cfg.asr.model, "E:\\other\\model");
+    }
+
+    #[test]
+    fn migrate_is_a_noop_for_the_same_root() {
+        // Arrange.
+        let mut cfg = Config::default();
+        cfg.asr.model = "C:\\cfg\\models\\m".into();
+        // Act.
+        let n = migrate_model_paths(
+            &mut cfg,
+            Path::new("C:\\cfg\\models"),
+            Path::new("C:\\cfg\\models"),
+        );
+        // Assert.
+        assert_eq!(n, 0);
+        assert_eq!(cfg.asr.model, "C:\\cfg\\models\\m");
+    }
+
+    #[test]
+    fn resolve_relative_model_prefers_models_root() {
+        // Arrange: the same relative name exists under the models root.
+        let base = std::env::temp_dir().join(format!("rapcoding-rmp-{}", std::process::id()));
+        let root = base.join("models-root");
+        let cfg_dir = base.join("cfg");
+        std::fs::create_dir_all(root.join("m")).unwrap();
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        // Act.
+        let resolved = resolve_model_path_in(&root, &cfg_dir, "m");
+        // Assert: the configured models root wins over the config dir.
+        assert_eq!(resolved, root.join("m"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn model_candidates_include_default_dir_after_cfg_dir() {
+        let root = Path::new("C:\\root\\models");
+        let cfg = Path::new("C:\\cfg");
+        let def = Path::new("C:\\def");
+        let c = model_candidates(root, cfg, def, "m");
+        assert_eq!(c[0], root.join("m"));
+        assert_eq!(c[1], cfg.join("m"));
+        // Default config dir follows the config dir, with and without the
+        // `models/` prefix (both conventions are covered).
+        assert_eq!(c[2], def.join("m"));
+        assert_eq!(c[3], def.join("models").join("m"));
+    }
+
+    #[test]
+    fn model_candidates_skip_default_when_same_as_cfg() {
+        let cfg = Path::new("C:\\cfg");
+        let c = model_candidates(&cfg.join("models"), cfg, cfg, "m");
+        // No duplicate candidates when the default dir equals the config dir.
+        assert_eq!(c.iter().filter(|x| **x == cfg.join("m")).count(), 1);
+    }
+
+    #[test]
+    fn models_prefixed_value_does_not_double_the_prefix() {
+        // Arrange: the config value already carries the `models/` prefix and
+        // the models root is itself `<config dir>/models` (the default).
+        let base = std::env::temp_dir().join(format!("rapcoding-dup-{}", std::process::id()));
+        let cfg_dir = base.join("cfg");
+        let root = cfg_dir.join("models");
+        std::fs::create_dir_all(root.join("vosk-x")).unwrap();
+        // Act.
+        let resolved = resolve_model_path_in(&root, &cfg_dir, "models/vosk-x");
+        // Assert: `<root>/vosk-x`, never `<root>/models/vosk-x`.
+        assert_eq!(resolved, root.join("vosk-x"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn models_prefixed_value_resolves_even_when_absent() {
+        // Arrange: nothing downloaded yet (the first-run case).
+        let base = std::env::temp_dir().join(format!("rapcoding-miss-{}", std::process::id()));
+        let cfg_dir = base.join("cfg");
+        let root = cfg_dir.join("models");
+        // Act.
+        let resolved = resolve_model_path_in(&root, &cfg_dir, "models/vosk-y");
+        // Assert: the expected download location, without a doubled prefix.
+        assert_eq!(resolved, root.join("vosk-y"));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn models_dir_survives_save_and_load() {
+        // Arrange: a custom folder chosen in the UI.
+        let path =
+            std::env::temp_dir().join(format!("rapcoding-models-dir-{}.toml", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rapcoding-md-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = dir.display().to_string();
+        // Act: save, load back (the restart path).
+        save(&path, &cfg).unwrap();
+        let loaded = load(&path).unwrap();
+        // Assert.
+        assert_eq!(loaded.asr.models_dir, cfg.asr.models_dir);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn vanished_models_dir_survives_a_restart_but_says_so() {
+        // Arrange: the folder disappeared (unplugged drive) between runs —
+        // a common case, and the app must still start.
+        let path = std::env::temp_dir().join(format!(
+            "rapcoding-models-dir-broken-{}.toml",
+            std::process::id()
+        ));
+        let missing = std::env::temp_dir().join("rapcoding-no-such-drive-XYZ\\models");
+        let mut cfg = Config::default();
+        cfg.asr.models_dir = missing.display().to_string();
+        save(&path, &cfg).unwrap();
+        // Act.
+        let loaded = load(&path).expect("a missing folder must not block startup");
+        // Assert: the choice is preserved verbatim, and the path is reported
+        // as unavailable (not silently replaced by the default).
+        assert_eq!(loaded.asr.models_dir, cfg.asr.models_dir);
+        assert!(
+            !loaded.asr.models_dir.trim().is_empty(),
+            "a vanished folder must not be reset to the default"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -463,7 +902,10 @@ mod tests {
         // Assert: only the target file, no temp sibling.
         let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
         assert!(path.exists());
-        assert!(!tmp.exists(), "temp file must not survive a successful save");
+        assert!(
+            !tmp.exists(),
+            "temp file must not survive a successful save"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -493,10 +935,8 @@ mod tests {
     fn failed_save_leaves_existing_file_untouched() {
         // Arrange: a valid config on disk and a directory squatting on the
         // temp-file name so the write must fail.
-        let path = std::env::temp_dir().join(format!(
-            "rapcoding-config-fail-{}.toml",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("rapcoding-config-fail-{}.toml", std::process::id()));
         let good = Config::default();
         save(&path, &good).unwrap();
         let tmp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
