@@ -252,7 +252,7 @@ fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
             journal.append("session", &format!("daemon failed: {msg}"));
         }
     }
-    gui::run(cfg, path, status, live, journal, verbose)
+    gui::run(cfg, path, status, live, journal, shared_cfg, transcripts, verbose)
 }
 
 /// Everything the recognition loop needs. Setup runs synchronously so early
