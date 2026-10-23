@@ -67,6 +67,19 @@ checks run this turn`. No footer = gate skipped = failure.
 - Keep the thinking level low for routine edits: reasoning tokens are billed as output and stay
   in the conversation context.
 
+## MCP usage (token-efficient)
+
+Full rationale + sources: skill `mcp-usage` (`.agents/skills/mcp-usage/`).
+
+- **New capability → cheapest option first** (A13): skill / CLI script / native tool;
+  a context server only for an external ecosystem (browser, DB, GitHub/Jira).
+- **Every enabled context server is an every-turn tax**: Zed has no deferred exposure, so
+  `context_servers` must stay minimal; a rarely-used server is cheaper enabled on demand.
+- **Skills are the on-demand layer**: a markdown file read only when the task matches.
+- **Bulk = one script**: N > 1 uniform calls in a single shell/Node run, reduced result only.
+- **Every MCP call is a delegated call** (A2): check errors/timeouts; a failed call is never success.
+- **Numbers, not opinions** (A1): "MCP is expensive/underused" → measure first.
+
 ## Hygiene
 
 - Keep the system prompt and tool set stable during a session so DeepSeek's automatic prefix
