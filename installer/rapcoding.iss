@@ -2,7 +2,7 @@
 ; Build from the repo root (needs Rust + cargo in PATH):
 ;   1. powershell -NoProfile -ExecutionPolicy Bypass -File installer\build.ps1
 ;   2. ISCC.exe installer\rapcoding.iss
-; Output: dist\RapcodingSetup-0.1.0.exe
+; Output: dist\RapcodingSetup-0.3.0.exe
 ;
 ; NOTE: the installer never downloads models. It only records the user's
 ; choice in %APPDATA%\rapcoding\pending-models.txt; the app's GUI downloads
@@ -12,7 +12,7 @@
 ; the installer hang forever.
 
 #define MyAppName "rapcoding"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "0.3.0"
 #define MyAppPublisher "lightclove"
 #define MyAppExeName "rapcoding.exe"
 
