@@ -18,6 +18,10 @@ use crate::download;
 use crate::error::Result;
 use crate::journal::Journal;
 use crate::log::{self, LiveLog};
+use crate::settings::{
+    self, can_save, draft_check, merge_reload, sync_owned, SettingsDraft,
+    SETTINGS_FIELDS, SETTINGS_SECTIONS,
+};
 use crate::status::Status;
 use crate::sync;
 
@@ -512,8 +516,7 @@ impl GuiApp {
                                 // Fresh draft from the current live config;
                                 // any previous capture is abandoned.
                                 self.capture = None;
-                                let cfg = self.cfg.clone();
-                                self.settings = Some(draft_open(&cfg, &self.config_path));
+                                self.settings = Some(SettingsDraft::new(&self.cfg));
                             }
                         }
                         self.page = page;
@@ -831,8 +834,7 @@ impl GuiApp {
 
     fn settings_page(&mut self, ui: &mut egui::Ui, p: Palette) {
         if self.settings.is_none() {
-            let cfg = self.cfg.clone();
-            self.settings = Some(draft_open(&cfg, &self.config_path));
+            self.settings = Some(SettingsDraft::new(&self.cfg));
         }
         let mut action: Option<SettingsAction> = None;
         {
@@ -847,15 +849,26 @@ impl GuiApp {
                     );
                     ui.label(
                         RichText::new(
-                            "Сохранение заблокировано, чтобы не затереть внешние правки. Перечитайте файл (черновик будет сброшен) или закройте страницу.",
+                            "В файле есть правки, сделанные вне UI, а у вас — несохранённые. Сохранение заблокировано. «Объединить» берёт ваши правки поверх файла (остальные поля — из файла), «Перечитать» сбрасывает черновик.",
                         )
                         .size(12.5)
                         .color(p.muted),
                     );
                     ui.add_space(6.0);
-                    if ui.button("Перечитать файл").clicked() {
-                        action = Some(SettingsAction::Reload);
-                    }
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("Объединить")
+                            .on_hover_text(
+                                "Сохранить мои правки, не теряя правки файла в других полях",
+                            )
+                            .clicked()
+                        {
+                            action = Some(SettingsAction::Merge);
+                        }
+                        if ui.button("Перечитать файл").clicked() {
+                            action = Some(SettingsAction::Reload);
+                        }
+                    });
                 });
                 ui.add_space(10.0);
             }
@@ -867,7 +880,7 @@ impl GuiApp {
                 Self::section_title(ui, p, title);
                 Self::card(ui, p, |ui| {
                     for meta in SETTINGS_FIELDS.iter().filter(|m| m.id.starts_with(section)) {
-                        settings_row(ui, p, draft, meta, &mut self.capture);
+                        Self::settings_row(ui, p, draft, meta, &mut self.capture);
                     }
                 });
             }
@@ -915,6 +928,7 @@ impl GuiApp {
                 }
             }
             Some(SettingsAction::Reload) => self.reload_settings_from_file(),
+            Some(SettingsAction::Merge) => self.merge_settings(),
             None => {}
         }
     }
@@ -944,15 +958,26 @@ impl GuiApp {
                 }
                 self.cfg = d.cfg.clone();
                 self.theme = Theme::from_config(&self.cfg.gui.theme);
-                self.journal
-                    .append("config", &format!("settings saved ({} fields)", SETTINGS_FIELDS.len()));
-                d.dirty = false;
-                d.errors.clear();
-                d.global_error = None;
-                d.fingerprint = fingerprint_file(&self.config_path);
+                self.journal.append(
+                    "config",
+                    &format!("settings saved ({} fields)", SETTINGS_FIELDS.len()),
+                );
+                d.mark_saved();
             }
             Err(e) => d.global_error = Some(e.to_string()),
         }
+    }
+
+    /// Merge external edits: re-read the file, keep fields edited in the
+    /// draft, adopt the rest. Then the normal save path runs (validate +
+    /// atomic write), so nothing invalid or partial reaches the disk.
+    fn merge_settings(&mut self) {
+        let Some(d) = self.settings.as_mut() else { return };
+        if let Err(e) = merge_reload(d, &self.config_path) {
+            d.global_error = Some(format!("Не удалось объединить: {e}"));
+            return;
+        }
+        self.save_settings();
     }
 
     /// External edit detected: reload from file (validates), re-open the
@@ -973,7 +998,148 @@ impl GuiApp {
         }
         self.cfg = loaded.clone();
         self.theme = Theme::from_config(&self.cfg.gui.theme);
-        self.settings = Some(draft_open(&self.cfg, &self.config_path));
+        let mut fresh = SettingsDraft::new(&self.cfg);
+        fresh.fresh = true;
+        self.settings = Some(fresh);
+        self.journal.append("config", "settings reloaded from file");
+    }
+
+    /// One settings row: label column, control, restart badge, error line.
+    fn settings_row(
+        ui: &mut egui::Ui,
+        p: Palette,
+        draft: &mut SettingsDraft,
+        meta: &settings::FieldMeta,
+        capture: &mut Option<&'static str>,
+    ) {
+        use settings::{field_mut, FieldValue, WidgetKind};
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            // Fixed-width label column keeps the controls aligned; the label
+            // is LEFT-aligned (centred labels leave a ragged column).
+            ui.allocate_ui_with_layout(
+                egui::vec2(210.0, 22.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(RichText::new(meta.label).size(13.0).color(p.text))
+                        .on_hover_text(meta.hint);
+                },
+            );
+            let Some(value) = field_mut(&mut draft.cfg, meta.id) else {
+                ui.colored_label(p.error, format!("неизвестное поле «{}»", meta.id));
+                return;
+            };
+            match (meta.kind, value) {
+                (WidgetKind::Bool, FieldValue::Bool(v)) => {
+                    changed = ui.checkbox(v, "").changed();
+                }
+                (WidgetKind::Choice(opts), FieldValue::Str(v)) => {
+                    egui::ComboBox::from_id_salt(meta.id)
+                        .selected_text(v.as_str())
+                        .width(140.0)
+                        .show_ui(ui, |ui| {
+                            for opt in opts {
+                                changed |=
+                                    ui.selectable_value(v, opt.to_string(), *opt).changed();
+                            }
+                        });
+                }
+                (WidgetKind::Float { min, max }, FieldValue::F32(v)) => {
+                    let speed = ((max - min) / 200.0).max(0.001);
+                    changed = ui
+                        .add(egui::DragValue::new(v).range(min..=max).speed(speed))
+                        .changed();
+                }
+                (WidgetKind::UInt { min, max }, FieldValue::U32(v)) => {
+                    let mut val = *v as u64;
+                    if ui
+                        .add(egui::DragValue::new(&mut val).range(min..=max))
+                        .changed()
+                    {
+                        *v = val as u32;
+                        changed = true;
+                    }
+                }
+                (WidgetKind::UInt { min, max }, FieldValue::U64(v)) => {
+                    changed = ui.add(egui::DragValue::new(v).range(min..=max)).changed();
+                }
+                (WidgetKind::Text, FieldValue::Str(v)) => {
+                    let w = ui.available_width().min(320.0);
+                    changed = ui
+                        .add(egui::TextEdit::singleline(v).desired_width(w))
+                        .changed();
+                }
+                (WidgetKind::Hotkey, FieldValue::Str(v)) => {
+                    if *capture == Some(meta.id) {
+                        ui.label(
+                            RichText::new("нажмите комбинацию… (Esc — отмена)")
+                                .size(12.5)
+                                .color(p.warn),
+                        );
+                        let (key, mods) = capture_key(ui);
+                        match key {
+                            Some(egui::Key::Escape) => *capture = None,
+                            Some(k) => {
+                                if let Some(s) = capture_hotkey(mods, k) {
+                                    if crate::hotkey::parse_hotkey(&s).is_ok() {
+                                        *v = s;
+                                        *capture = None;
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                    } else {
+                        let w = (ui.available_width() - 90.0).clamp(80.0, 240.0);
+                        changed = ui
+                            .add(egui::TextEdit::singleline(v).desired_width(w))
+                            .changed();
+                        if ui
+                            .button("Записать")
+                            .on_hover_text(
+                                "Нажать комбинацию на клавиатуре (клавиша Win не ловится — впишите вручную)",
+                            )
+                            .clicked()
+                        {
+                            *capture = Some(meta.id);
+                        }
+                    }
+                }
+                _ => {
+                    ui.colored_label(p.error, "виджет не соответствует типу поля");
+                }
+            }
+            if meta.restart {
+                badge(ui, "после перезапуска", p.muted);
+            }
+        });
+        if changed {
+            draft.dirty = true;
+            draft.errors.clear();
+            draft.global_error = None;
+        }
+        if let Some(msg) = draft
+            .errors
+            .iter()
+            .find(|(id, _)| *id == meta.id)
+            .map(|(_, m)| m.clone())
+        {
+            ui.colored_label(p.error, format!("{}: {msg}", meta.label));
+        }
+        if meta.id == "gui.enabled" {
+            if let Some(FieldValue::Bool(v)) = field_mut(&mut draft.cfg, "gui.enabled") {
+                if !*v {
+                    ui.label(
+                        RichText::new(
+                            "Окно не будет открываться при запуске — консольный режим. Вернуть окно: rapcoding --gui или правка конфига.",
+                        )
+                        .size(12.0)
+                        .color(p.warn),
+                    );
+                }
+            }
+        }
     }
 
     fn models_card(&self, ui: &mut egui::Ui, p: Palette) {
@@ -1541,187 +1707,15 @@ impl GuiApp {
     }
 }
 
-// ------------------------------------------------------- settings machinery
+// ------------------------------------------------------- settings machinery (ui)
 
 /// What a user action on the settings page resolves to (executed after the
 /// render loop so the draft borrow can end first).
-#[derive(Clone, Copy, PartialEq, Debug)]
 enum SettingsAction {
     Save,
     Reset,
     Reload,
-}
-
-/// UI control kind for a config field.
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum WidgetKind {
-    Bool,
-    Choice(&'static [&'static str]),
-    Float { min: f32, max: f32 },
-    UInt { min: u64, max: u64 },
-    Text,
-    Hotkey,
-}
-
-/// Declarative mapping config field -> UI control. `id` must equal the
-/// dotted TOML key; a drift test pins this set against the serialized
-/// schema, so the UI can never silently diverge from the config file.
-#[derive(Clone, Copy, Debug)]
-struct FieldMeta {
-    id: &'static str,
-    label: &'static str,
-    hint: &'static str,
-    kind: WidgetKind,
-    /// Daemon reads this field only at startup -> applies after restart.
-    restart: bool,
-}
-
-const SETTINGS_FIELDS: &[FieldMeta] = &[
-    FieldMeta { id: "general.mode", label: "Режим записи", hint: "hold — запись, пока держите хоткей; toggle — одно нажатие включает, второе выключает", kind: WidgetKind::Choice(&["hold", "toggle"]), restart: true },
-    FieldMeta { id: "general.hotkey", label: "Хоткей (русский)", hint: "Например: f9, ctrl+alt+space. Клавишу Win впишите вручную — виджет захвата её не ловит", kind: WidgetKind::Hotkey, restart: true },
-    FieldMeta { id: "general.en_hotkey", label: "Хоткей (английский)", hint: "Должен отличаться от русского хоткея", kind: WidgetKind::Hotkey, restart: true },
-    FieldMeta { id: "general.max_record_secs", label: "Макс. длительность записи, с", hint: "Авто-остановка, чтобы запись не шла бесконечно", kind: WidgetKind::UInt { min: 1, max: 3600 }, restart: false },
-    FieldMeta { id: "general.log_transcripts", label: "Писать расшифровки в лог", hint: "Приватность: по умолчанию текст распознавания в лог не попадает", kind: WidgetKind::Bool, restart: false },
-    FieldMeta { id: "audio.device", label: "Устройство ввода", hint: "Пусто — системное по умолчанию; иначе подстрока имени. Удобный выбор — на странице «Звук»", kind: WidgetKind::Text, restart: true },
-    FieldMeta { id: "audio.silence_threshold", label: "Порог тишины", hint: "Доля амплитуды 0..1: тише — считается тишиной", kind: WidgetKind::Float { min: 0.0, max: 0.999 }, restart: false },
-    FieldMeta { id: "audio.silence_padding_ms", label: "Паузы вокруг речи, мс", hint: "Сколько тишины оставлять по краям фразы", kind: WidgetKind::UInt { min: 0, max: 5000 }, restart: false },
-    FieldMeta { id: "audio.min_speech_ms", label: "Минимум речи, мс", hint: "Более короткие звуки отбрасываются как шум", kind: WidgetKind::UInt { min: 0, max: 60000 }, restart: false },
-    FieldMeta { id: "asr.model", label: "Модель (русский)", hint: "Путь к распакованной модели; активация — на странице «Модели»", kind: WidgetKind::Text, restart: true },
-    FieldMeta { id: "asr.en_model", label: "Модель (английский)", hint: "Загружается при первом использовании английского хоткея", kind: WidgetKind::Text, restart: true },
-    FieldMeta { id: "text.voice_commands", label: "Голосовые команды", hint: "off — выключены; safe — многословные; aggressive — + однословные", kind: WidgetKind::Choice(&["off", "safe", "aggressive"]), restart: false },
-    FieldMeta { id: "text.remove_sound_tags", label: "Убирать звуковые теги", hint: "[звук], [шум] и т.п. удаляются из текста", kind: WidgetKind::Bool, restart: false },
-    FieldMeta { id: "text.strip_punctuation", label: "Убирать пунктуацию", hint: "Только слова: точки, запятые, кавычки удаляются", kind: WidgetKind::Bool, restart: false },
-    FieldMeta { id: "inject.enabled", label: "Вставлять текст", hint: "Выключено — распознавание работает, но текст не печатается", kind: WidgetKind::Bool, restart: true },
-    FieldMeta { id: "inject.method", label: "Способ ввода", hint: "paste — через буфер обмена; type — посимвольная эмуляция клавиатуры", kind: WidgetKind::Choice(&["paste", "type"]), restart: true },
-    FieldMeta { id: "inject.paste_shortcut", label: "Свой шорткат вставки", hint: "Пусто — ctrl+v; например ctrl+shift+v для терминалов", kind: WidgetKind::Text, restart: true },
-    FieldMeta { id: "inject.restore_clipboard", label: "Восстанавливать буфер", hint: "После вставки вернуть прежнее содержимое буфера обмена", kind: WidgetKind::Bool, restart: true },
-    FieldMeta { id: "inject.settle_ms", label: "Пауза после вставки, мс", hint: "Ожидание перед восстановлением буфера", kind: WidgetKind::UInt { min: 0, max: 10000 }, restart: true },
-    FieldMeta { id: "gui.enabled", label: "Окно при запуске", hint: "Выключено — консольный режим: окно не откроется при старте (вернуть: rapcoding --gui)", kind: WidgetKind::Bool, restart: true },
-    FieldMeta { id: "gui.theme", label: "Тема", hint: "Переключается и в шапке окна", kind: WidgetKind::Choice(&["light", "dark"]), restart: false },
-];
-
-/// Note: the deprecated `audio.sample_rate` (ignored, kept for old configs)
-/// is deliberately absent from the UI.
-const SETTINGS_SECTIONS: &[(&str, &str)] = &[
-    ("general", "Общие"),
-    ("audio", "Запись"),
-    ("asr", "Модели распознавания"),
-    ("text", "Обработка текста"),
-    ("inject", "Ввод текста"),
-    ("gui", "Интерфейс"),
-];
-
-/// Live view of one config field for the widgets.
-#[derive(Debug)]
-enum FieldValue<'a> {
-    Bool(&'a mut bool),
-    Str(&'a mut String),
-    F32(&'a mut f32),
-    U32(&'a mut u32),
-    U64(&'a mut u64),
-}
-
-/// Resolve a dotted field id to the live value. None for unknown ids —
-/// callers show a loud error instead of silently skipping a field.
-fn field_mut<'a>(cfg: &'a mut Config, id: &str) -> Option<FieldValue<'a>> {
-    Some(match id {
-        "general.mode" => FieldValue::Str(&mut cfg.general.mode),
-        "general.hotkey" => FieldValue::Str(&mut cfg.general.hotkey),
-        "general.en_hotkey" => FieldValue::Str(&mut cfg.general.en_hotkey),
-        "general.max_record_secs" => FieldValue::U64(&mut cfg.general.max_record_secs),
-        "general.log_transcripts" => FieldValue::Bool(&mut cfg.general.log_transcripts),
-        "audio.device" => FieldValue::Str(&mut cfg.audio.device),
-        "audio.silence_threshold" => FieldValue::F32(&mut cfg.audio.silence_threshold),
-        "audio.silence_padding_ms" => FieldValue::U32(&mut cfg.audio.silence_padding_ms),
-        "audio.min_speech_ms" => FieldValue::U32(&mut cfg.audio.min_speech_ms),
-        "asr.model" => FieldValue::Str(&mut cfg.asr.model),
-        "asr.en_model" => FieldValue::Str(&mut cfg.asr.en_model),
-        "text.voice_commands" => FieldValue::Str(&mut cfg.text.voice_commands),
-        "text.remove_sound_tags" => FieldValue::Bool(&mut cfg.text.remove_sound_tags),
-        "text.strip_punctuation" => FieldValue::Bool(&mut cfg.text.strip_punctuation),
-        "inject.enabled" => FieldValue::Bool(&mut cfg.inject.enabled),
-        "inject.method" => FieldValue::Str(&mut cfg.inject.method),
-        "inject.paste_shortcut" => FieldValue::Str(&mut cfg.inject.paste_shortcut),
-        "inject.restore_clipboard" => FieldValue::Bool(&mut cfg.inject.restore_clipboard),
-        "inject.settle_ms" => FieldValue::U64(&mut cfg.inject.settle_ms),
-        "gui.enabled" => FieldValue::Bool(&mut cfg.gui.enabled),
-        "gui.theme" => FieldValue::Str(&mut cfg.gui.theme),
-        _ => return None,
-    })
-}
-
-/// The edit buffer of the settings page: a working copy of the config plus
-/// bookkeeping. Nothing here touches the disk until «Сохранить».
-struct SettingsDraft {
-    cfg: Config,
-    dirty: bool,
-    /// Field-attributed errors from the last save attempt: (id, message).
-    errors: Vec<(String, String)>,
-    /// Non-attributable error from the last save attempt.
-    global_error: Option<String>,
-    /// Content hash of config.toml when the draft was opened / last saved.
-    fingerprint: Option<u64>,
-    /// File changed externally since the draft was opened -> save blocked.
-    stale: bool,
-}
-
-/// Content hash of a file (config files are tiny; hashing is cheap). None
-/// when the file is missing.
-fn fingerprint_file(path: &std::path::Path) -> Option<u64> {
-    use std::hash::{Hash, Hasher};
-    let bytes = std::fs::read(path).ok()?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut h);
-    Some(h.finish())
-}
-
-/// True when the file on disk differs from what the draft was opened on.
-fn file_changed_externally(d: &SettingsDraft, path: &std::path::Path) -> bool {
-    d.fingerprint != fingerprint_file(path)
-}
-
-fn draft_open(cfg: &Config, path: &std::path::Path) -> SettingsDraft {
-    SettingsDraft {
-        cfg: cfg.clone(),
-        dirty: false,
-        errors: Vec::new(),
-        global_error: None,
-        fingerprint: fingerprint_file(path),
-        stale: false,
-    }
-}
-
-/// Copy fields also edited from other pages (header theme, Sound device,
-/// Models activation) from the live config, so «Сохранить» cannot silently
-/// revert a change made elsewhere while the draft was open.
-fn sync_owned(d: &mut SettingsDraft, live: &Config) {
-    d.cfg.gui.theme = live.gui.theme.clone();
-    d.cfg.audio.device = live.audio.device.clone();
-    d.cfg.asr.model = live.asr.model.clone();
-    d.cfg.asr.en_model = live.asr.en_model.clone();
-}
-
-/// Validate a draft: hotkey fields are attributed to their row; everything
-/// else surfaces as one global error (same contract as `rapcoding check`).
-fn draft_check(cfg: &Config) -> (Vec<(String, String)>, Option<String>) {
-    let mut fields = Vec::new();
-    if let Err(e) = crate::hotkey::parse_hotkey(&cfg.general.hotkey) {
-        fields.push(("general.hotkey".into(), e.to_string()));
-    }
-    if let Err(e) = crate::hotkey::parse_hotkey(&cfg.general.en_hotkey) {
-        fields.push(("general.en_hotkey".into(), e.to_string()));
-    }
-    if fields.is_empty() {
-        // Config::validate stops at the first hotkey error; when hotkeys are
-        // already attributed above, running it would duplicate the message.
-        (fields, cfg.validate().err().map(|e| e.to_string()))
-    } else {
-        (fields, None)
-    }
-}
-
-fn can_save(d: &SettingsDraft) -> bool {
-    d.dirty && !d.stale
+    Merge,
 }
 
 /// Push a saved config into the shared daemon state: the live subset takes
@@ -1731,11 +1725,21 @@ fn apply_live(shared: &RwLock<Config>, transcripts: &AtomicBool, cfg: &Config) {
     transcripts.store(cfg.general.log_transcripts, Ordering::Relaxed);
 }
 
+/// True when the file on disk holds values the draft was not based on.
+fn file_changed_externally(d: &SettingsDraft, path: &std::path::Path) -> bool {
+    match config::load(path) {
+        Ok(current) if !d.dirty => settings::field_differs(&current, "general.mode", &d.baseline)
+            || settings::external_change(d, &current).is_some(),
+        Ok(current) => settings::is_stale(d, &current),
+        // An unreadable/invalid file still means "it changed on us".
+        Err(_) => true,
+    }
+}
+
 /// Compose a hotkey string from egui modifiers + main key in the spelling
 /// [`crate::hotkey::parse_hotkey`] accepts. None when the key cannot be a
 /// main key. Note: egui does not report the Win key, so "win" combos must
 /// be typed by hand (the text field accepts them).
-#[cfg(feature = "gui")]
 fn capture_hotkey(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
     let main = egui_key_name(key)?;
     let mut parts: Vec<&str> = Vec::new();
@@ -1753,7 +1757,9 @@ fn capture_hotkey(mods: egui::Modifiers, key: egui::Key) -> Option<String> {
 }
 
 /// Lowercase name of an egui key, matching what the hotkey parser accepts.
-#[cfg(feature = "gui")]
+/// Covers letters, digits, F1-F24, punctuation, arrows and navigation —
+/// enough for any practical shortcut; unknown keys return None (and the
+/// capture widget ignores them, never emitting an unparseable string).
 fn egui_key_name(k: egui::Key) -> Option<&'static str> {
     use egui::Key as K;
     Some(match k {
@@ -1868,132 +1874,6 @@ fn capture_key(ui: &mut egui::Ui) -> (Option<egui::Key>, egui::Modifiers) {
         });
     });
     out
-}
-
-/// One settings row: label, control, restart badge, per-field error line.
-/// Mutates the draft in place.
-fn settings_row(
-    ui: &mut egui::Ui,
-    p: Palette,
-    draft: &mut SettingsDraft,
-    meta: &FieldMeta,
-    capture: &mut Option<&'static str>,
-) {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.add_sized(
-            [230.0, 20.0],
-            egui::Label::new(RichText::new(meta.label).size(13.0).color(p.text)),
-        )
-        .on_hover_text(meta.hint);
-        let Some(value) = field_mut(&mut draft.cfg, meta.id) else {
-            ui.colored_label(p.error, format!("неизвестное поле «{}»", meta.id));
-            return;
-        };
-        match (meta.kind, value) {
-            (WidgetKind::Bool, FieldValue::Bool(v)) => {
-                changed = ui.checkbox(v, "").changed();
-            }
-            (WidgetKind::Choice(opts), FieldValue::Str(v)) => {
-                egui::ComboBox::from_id_salt(meta.id)
-                    .selected_text(v.as_str())
-                    .show_ui(ui, |ui| {
-                        for opt in opts {
-                            changed |= ui.selectable_value(v, opt.to_string(), *opt).changed();
-                        }
-                    });
-            }
-            (WidgetKind::Float { min, max }, FieldValue::F32(v)) => {
-                let speed = ((max - min) / 200.0).max(0.001);
-                changed = ui
-                    .add(egui::DragValue::new(v).range(min..=max).speed(speed))
-                    .changed();
-            }
-            (WidgetKind::UInt { min, max }, FieldValue::U32(v)) => {
-                let mut val = *v as u64;
-                if ui.add(egui::DragValue::new(&mut val).range(min..=max)).changed() {
-                    *v = val as u32;
-                    changed = true;
-                }
-            }
-            (WidgetKind::UInt { min, max }, FieldValue::U64(v)) => {
-                changed = ui.add(egui::DragValue::new(v).range(min..=max)).changed();
-            }
-            (WidgetKind::Text, FieldValue::Str(v)) => {
-                changed = ui
-                    .add(egui::TextEdit::singleline(v).desired_width(300.0))
-                    .changed();
-            }
-            (WidgetKind::Hotkey, FieldValue::Str(v)) => {
-                if *capture == Some(meta.id) {
-                    ui.label(
-                        RichText::new("нажмите комбинацию… (Esc — отмена)")
-                            .size(12.5)
-                            .color(p.warn),
-                    );
-                    let (key, mods) = capture_key(ui);
-                    match key {
-                        Some(egui::Key::Escape) => *capture = None,
-                        Some(k) => {
-                            if let Some(s) = capture_hotkey(mods, k) {
-                                if crate::hotkey::parse_hotkey(&s).is_ok() {
-                                    *v = s;
-                                    *capture = None;
-                                    changed = true;
-                                }
-                            }
-                        }
-                        None => {}
-                    }
-                } else {
-                    changed = ui
-                        .add(egui::TextEdit::singleline(v).desired_width(260.0))
-                        .changed();
-                    if ui
-                        .button("Записать")
-                        .on_hover_text(
-                            "Нажать комбинацию на клавиатуре (клавиша Win не ловится — впишите вручную)",
-                        )
-                        .clicked()
-                    {
-                        *capture = Some(meta.id);
-                    }
-                }
-            }
-            _ => {
-                ui.colored_label(p.error, "виджет не соответствует типу поля");
-            }
-        }
-        if meta.restart {
-            badge(ui, "после перезапуска", p.muted);
-        }
-    });
-    if changed {
-        draft.dirty = true;
-        draft.errors.clear();
-        draft.global_error = None;
-    }
-    if let Some(msg) = draft
-        .errors
-        .iter()
-        .find(|(id, _)| *id == meta.id)
-        .map(|(_, m)| m.clone())
-    {
-        ui.colored_label(p.error, format!("{}: {msg}", meta.label));
-    }
-    if meta.id == "gui.enabled" {
-        if let Some(FieldValue::Bool(v)) = field_mut(&mut draft.cfg, "gui.enabled") {
-            if !*v {
-                ui.label(
-                    RichText::new(
-                        "Окно не будет открываться при запуске — консольный режим. Вернуть окно: rapcoding --gui или правка конфига.",
-                    )
-                    .size(12.0)
-                    .color(p.warn),
-                );
-            }
-        }
-    }
 }
 
 // ------------------------------------------------------------- small views
@@ -2244,291 +2124,14 @@ mod tests {
         assert!(!DlState::Canceled.is_busy());
     }
 
-    // ------------------------------------------------------ settings page
-
-    #[test]
-    fn settings_fields_cover_all_toml_keys() {
-        // Arrange: dotted keys of the serialized default config.
-        let toml_s = toml::to_string_pretty(&Config::default()).unwrap();
-        let root: toml::Value = toml::from_str(&toml_s).unwrap();
-        let mut keys = std::collections::BTreeSet::new();
-        fn walk(prefix: &str, v: &toml::Value, keys: &mut std::collections::BTreeSet<String>) {
-            match v {
-                toml::Value::Table(t) => {
-                    for (k, val) in t {
-                        walk(&format!("{prefix}{k}."), val, keys);
-                    }
-                }
-                _ => {
-                    keys.insert(prefix.trim_end_matches('.').to_string());
-                }
-            }
-        }
-        walk("", &root, &mut keys);
-        // Act.
-        let meta: std::collections::BTreeSet<String> =
-            SETTINGS_FIELDS.iter().map(|m| m.id.to_string()).collect();
-        // Assert: the UI mapping equals the schema exactly (no drift).
-        assert_eq!(keys, meta, "settings UI must map every config key exactly once");
-    }
-
-    #[test]
-    fn field_mut_resolves_every_meta_id() {
-        // Arrange.
-        let mut cfg = Config::default();
-        // Act/Assert: every declared id resolves; unknown ids do not.
-        for m in SETTINGS_FIELDS {
-            assert!(field_mut(&mut cfg, m.id).is_some(), "{} must resolve", m.id);
-        }
-        assert!(field_mut(&mut cfg, "general.bogus").is_none());
-        assert!(
-            field_mut(&mut cfg, "audio.sample_rate").is_none(),
-            "deprecated field must stay hidden"
-        );
-    }
-
-    #[test]
-    fn numeric_ui_bounds_are_a_subset_of_validation() {
-        // Arrange: for each numeric field, UI bounds may only be tighter than
-        // the validation contract — min/max must pass, outside must fail.
-        for m in SETTINGS_FIELDS {
-            match m.kind {
-                WidgetKind::Float { min, max } => {
-                    let mut c = Config::default();
-                    {
-                        if let Some(FieldValue::F32(v)) = field_mut(&mut c, m.id) {
-                            *v = min;
-                        }
-                    }
-                    assert!(c.validate().is_ok(), "{} min must validate", m.id);
-                    {
-                        if let Some(FieldValue::F32(v)) = field_mut(&mut c, m.id) {
-                            *v = max;
-                        }
-                    }
-                    assert!(c.validate().is_ok(), "{} max must validate", m.id);
-                    {
-                        if let Some(FieldValue::F32(v)) = field_mut(&mut c, m.id) {
-                            *v = max + 0.1;
-                        }
-                    }
-                    assert!(c.validate().is_err(), "{} beyond max must fail", m.id);
-                }
-                WidgetKind::UInt { min, max } => {
-                    let mut c = Config::default();
-                    match field_mut(&mut c, m.id) {
-                        Some(FieldValue::U32(_)) => {
-                            {
-                                if let Some(FieldValue::U32(v)) = field_mut(&mut c, m.id) {
-                                    *v = min as u32;
-                                }
-                            }
-                            assert!(c.validate().is_ok(), "{} min must validate", m.id);
-                            {
-                                if let Some(FieldValue::U32(v)) = field_mut(&mut c, m.id) {
-                                    *v = max as u32;
-                                }
-                            }
-                            assert!(c.validate().is_ok(), "{} max must validate", m.id);
-                            {
-                                if let Some(FieldValue::U32(v)) = field_mut(&mut c, m.id) {
-                                    *v = max as u32 + 1;
-                                }
-                            }
-                            assert!(c.validate().is_err(), "{} beyond max must fail", m.id);
-                        }
-                        Some(FieldValue::U64(_)) => {
-                            {
-                                if let Some(FieldValue::U64(v)) = field_mut(&mut c, m.id) {
-                                    *v = min;
-                                }
-                            }
-                            assert!(c.validate().is_ok(), "{} min must validate", m.id);
-                            {
-                                if let Some(FieldValue::U64(v)) = field_mut(&mut c, m.id) {
-                                    *v = max;
-                                }
-                            }
-                            assert!(c.validate().is_ok(), "{} max must validate", m.id);
-                            {
-                                if let Some(FieldValue::U64(v)) = field_mut(&mut c, m.id) {
-                                    *v = max + 1;
-                                }
-                            }
-                            assert!(c.validate().is_err(), "{} beyond max must fail", m.id);
-                        }
-                        _ => panic!("{}: kind/id mismatch", m.id),
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    #[test]
-    fn choice_options_validate() {
-        // Arrange: every allowed option must pass the config contract.
-        for m in SETTINGS_FIELDS {
-            if let WidgetKind::Choice(opts) = m.kind {
-                for opt in opts {
-                    let mut c = Config::default();
-                    if let Some(FieldValue::Str(v)) = field_mut(&mut c, m.id) {
-                        *v = opt.to_string();
-                        assert!(c.validate().is_ok(), "{} = {} must validate", m.id, opt);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn live_restart_contract_matches_spec() {
-        // Arrange: the spec (Q1 = Option B) pins the live subset.
-        let expected_live: std::collections::BTreeSet<&str> = [
-            "general.max_record_secs",
-            "general.log_transcripts",
-            "audio.silence_threshold",
-            "audio.silence_padding_ms",
-            "audio.min_speech_ms",
-            "text.voice_commands",
-            "text.remove_sound_tags",
-            "text.strip_punctuation",
-            "gui.theme", // GUI-applied instantly; not daemon state
-        ]
-        .into();
-        // Act.
-        let live: std::collections::BTreeSet<&str> = SETTINGS_FIELDS
-            .iter()
-            .filter(|m| !m.restart)
-            .map(|m| m.id)
-            .collect();
-        // Assert.
-        assert_eq!(live, expected_live, "restart flags drifted from the spec");
-    }
-
-    #[test]
-    fn draft_save_logic() {
-        // Arrange: a draft on a real temp file.
-        let path = std::env::temp_dir().join("rapcoding-settings-draft.toml");
-        let _ = std::fs::remove_file(&path);
-        std::fs::write(&path, config::DEFAULT_CONFIG).unwrap();
-        let mut d = draft_open(&Config::default(), &path);
-        // Assert: fresh draft is clean and not saveable (nothing to save).
-        assert!(!d.dirty);
-        assert!(!d.stale);
-        assert!(!can_save(&d));
-        // Act: edit and mark dirty.
-        d.cfg.general.max_record_secs = 9;
-        d.dirty = true;
-        // Assert.
-        assert!(can_save(&d));
-        // Act: external edit changes the file content.
-        std::fs::write(&path, "x = 1\n").unwrap();
-        // Assert: the detector sees it, and save must be blocked.
-        assert!(file_changed_externally(&d, &path));
-        d.stale = true;
-        assert!(!can_save(&d), "stale draft must block save");
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn draft_check_attributes_hotkey_errors() {
-        // Arrange: a hotkey with wrong token order.
-        let mut c = Config::default();
-        c.general.hotkey = "ctrl+space+alt".into();
-        // Act.
-        let (fields, global) = draft_check(&c);
-        // Assert: attributed to the field, no duplicate global error.
-        assert_eq!(fields.len(), 1);
-        assert_eq!(fields[0].0, "general.hotkey");
-        assert!(global.is_none());
-    }
-
-    #[test]
-    fn draft_check_global_error_when_hotkeys_fine() {
-        // Arrange: invalid mode, valid hotkeys.
-        let mut c = Config::default();
-        c.general.mode = "latch".into();
-        // Act.
-        let (fields, global) = draft_check(&c);
-        // Assert.
-        assert!(fields.is_empty());
-        assert!(global.is_some());
-    }
-
-    #[test]
-    fn draft_check_clean_config_passes() {
-        // Arrange.
-        let c = Config::default();
-        // Act.
-        let (fields, global) = draft_check(&c);
-        // Assert.
-        assert!(fields.is_empty());
-        assert!(global.is_none());
-    }
-
-    #[test]
-    fn sync_owned_copies_external_fields_only() {
-        // Arrange: draft edited everywhere; live has other-page changes.
-        let mut d = draft_open(&Config::default(), std::path::Path::new("x.toml"));
-        d.cfg.general.max_record_secs = 42; // owned by settings page — must survive
-        d.cfg.gui.theme = "dark".into(); // will be overwritten by the live value
-        let mut live = Config::default();
-        live.gui.theme = "light".into();
-        live.audio.device = "Mic".into();
-        live.asr.model = "m1".into();
-        live.asr.en_model = "m2".into();
-        // Act.
-        sync_owned(&mut d, &live);
-        // Assert: other-page fields follow the live config; settings-owned
-        // edits survive.
-        assert_eq!(d.cfg.gui.theme, "light");
-        assert_eq!(d.cfg.audio.device, "Mic");
-        assert_eq!(d.cfg.asr.model, "m1");
-        assert_eq!(d.cfg.asr.en_model, "m2");
-        assert_eq!(d.cfg.general.max_record_secs, 42);
-    }
-
-    #[test]
-    fn apply_live_updates_shared_config_and_flag() {
-        // Arrange.
-        let shared = RwLock::new(Config::default());
-        let flag = Arc::new(AtomicBool::new(false));
-        let mut cfg = Config::default();
-        cfg.general.log_transcripts = true;
-        cfg.text.strip_punctuation = true;
-        // Act.
-        apply_live(&shared, &flag, &cfg);
-        // Assert.
-        let snap = shared.read().unwrap();
-        assert!(snap.general.log_transcripts);
-        assert!(snap.text.strip_punctuation);
-        assert!(flag.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn fingerprint_detects_content_change() {
-        // Arrange.
-        let path = std::env::temp_dir().join("rapcoding-settings-fp.toml");
-        std::fs::write(&path, "a").unwrap();
-        let fp1 = fingerprint_file(&path);
-        // Act.
-        std::fs::write(&path, "b").unwrap();
-        let fp2 = fingerprint_file(&path);
-        let _ = std::fs::remove_file(&path);
-        // Assert.
-        assert!(fp1.is_some());
-        assert_ne!(fp1, fp2, "content change must change the fingerprint");
-        assert_eq!(
-            fingerprint_file(std::path::Path::new("nonexistent-rapcoding.toml")),
-            None
-        );
-    }
-
     #[test]
     fn capture_composes_parseable_hotkeys() {
         // Arrange: ctrl+alt pressed, matrix of main keys.
-        let mods = egui::Modifiers { ctrl: true, alt: true, ..egui::Modifiers::NONE };
+        let mods = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..egui::Modifiers::NONE
+        };
         for (key, main) in [
             (egui::Key::F9, "f9"),
             (egui::Key::A, "a"),

@@ -283,7 +283,6 @@ pub fn load(path: &Path) -> Result<Config> {
 /// the target (`fs::rename` maps to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`
 /// on Windows). A crash or full disk mid-write can therefore never leave a
 /// truncated config that would brick the next start.
-#[cfg(feature = "gui")]
 pub fn save(path: &Path, cfg: &Config) -> Result<()> {
     let s = toml::to_string_pretty(cfg)?;
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));

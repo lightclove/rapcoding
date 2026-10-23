@@ -10,6 +10,7 @@ mod hotkey;
 mod inject;
 mod journal;
 mod log;
+mod settings;
 mod single;
 mod status;
 mod sync;
