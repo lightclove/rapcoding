@@ -17,6 +17,48 @@ pub enum Level {
     Debug = 2,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Where log lines go. A GUI run has no console window: writing to stderr
+/// there is either invisible or re-opens a console, so the UI log page and the
+/// log file are the only sinks (SC-gui-console).
+pub struct LogTargets {
+    /// Mirror every line to stderr (headless/console runs).
+    pub stderr: bool,
+}
+
+impl LogTargets {
+    /// Headless run: the terminal is the primary output.
+    pub fn console() -> Self {
+        LogTargets { stderr: true }
+    }
+
+    /// GUI run: logs live in the window (log page) and on disk only.
+    pub fn ui_only() -> Self {
+        LogTargets { stderr: false }
+    }
+}
+
+impl Default for LogTargets {
+    fn default() -> Self {
+        Self::console()
+    }
+}
+
+/// Process-wide switch for log lines that bypass the logger (the audio
+/// callback must not lock the logger mutex from a real-time thread). `true` by
+/// default so every existing path keeps writing to stderr; a GUI run turns it
+/// off in `main` before any thread spawns.
+static STDERR_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether stray stderr writes (audio stream errors) should reach the console.
+pub fn stderr_enabled() -> bool {
+    STDERR_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_stderr_enabled(enabled: bool) {
+    STDERR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 #[derive(Clone)]
 pub struct Logger {
     inner: Arc<Mutex<Inner>>,
@@ -31,6 +73,7 @@ struct Inner {
     /// live, without restarting the daemon (or its logger).
     log_transcripts: Arc<AtomicBool>,
     live: Option<LiveLog>,
+    targets: LogTargets,
 }
 
 impl Logger {
@@ -40,6 +83,16 @@ impl Logger {
         log_transcripts: Arc<AtomicBool>,
         live: Option<LiveLog>,
     ) -> Result<Self> {
+        Self::new_with_live_in(path, level, log_transcripts, live, LogTargets::console())
+    }
+
+    pub fn new_with_live_in(
+        path: PathBuf,
+        level: Level,
+        log_transcripts: Arc<AtomicBool>,
+        live: Option<LiveLog>,
+        targets: LogTargets,
+    ) -> Result<Self> {
         let mut inner = Inner {
             file: None,
             path,
@@ -47,6 +100,7 @@ impl Logger {
             start: Instant::now(),
             log_transcripts,
             live,
+            targets,
         };
         inner.rotate_if_needed()?;
         Ok(Logger {
@@ -90,7 +144,7 @@ impl Logger {
             level_name(level),
             sanitize(msg)
         );
-        write_line(&mut std::io::stderr(), &line);
+        write_line_if(inner.targets.stderr, &line);
         if let Some(live) = &inner.live {
             live.push(&line);
         }
@@ -158,6 +212,14 @@ pub(crate) fn sanitize(msg: &str) -> String {
 
 /// Write a line to a sink, swallowing I/O errors so a broken pipe or a closed
 /// stream can never panic a caller (the daemon loop or the audio thread).
+/// Write a log line to stderr when enabled; always a no-op the caller can
+/// rely on not panicking (a broken pipe must not kill a real-time thread).
+pub(crate) fn write_line_if(enabled: bool, line: &str) {
+    if enabled {
+        write_line(&mut std::io::stderr(), line);
+    }
+}
+
 pub(crate) fn write_line<W: std::io::Write>(w: &mut W, line: &str) {
     let _ = writeln!(w, "{line}");
 }
@@ -223,6 +285,7 @@ mod tests {
             start: Instant::now(),
             log_transcripts: Arc::new(AtomicBool::new(false)),
             live: None,
+            targets: LogTargets::console(),
         };
         inner.rotate_if_needed().unwrap();
         assert!(
@@ -329,6 +392,63 @@ mod tests {
         // Must not panic even though every write fails.
         write_line(&mut w, "hello");
         write_line(&mut w, "a\nb\x1b[31m");
+    }
+
+    // --- SC-gui-console: no console window, logs inside the UI -----------
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn silent_console_skips_stderr_but_keeps_live_and_file() {
+        // Arrange: a GUI run — no console window to write to.
+        let dir = std::env::temp_dir().join(format!("rapcoding-silent-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("t.log");
+        let live = LiveLog::new(10);
+        let logger = Logger::new_with_live_in(
+            path.clone(),
+            Level::Info,
+            Arc::new(AtomicBool::new(false)),
+            Some(live.clone()),
+            LogTargets::ui_only(),
+        )
+        .expect("logger");
+        // Act.
+        logger.info("hello from gui");
+        // Assert: the UI buffer got it and the file got it.
+        assert!(
+            live.snapshot().iter().any(|l| l.contains("hello from gui")),
+            "live log must receive the line"
+        );
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(on_disk.contains("hello from gui"), "file must receive the line");
+        // And the policy says: do not write to stderr.
+        assert!(!LogTargets::ui_only().stderr);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn console_run_keeps_stderr() {
+        // A headless run must keep printing to the terminal.
+        assert!(LogTargets::console().stderr);
+    }
+
+    #[test]
+    fn log_targets_default_matches_console() {
+        // Existing callers that do not care keep the old behaviour.
+        assert_eq!(LogTargets::default().stderr, LogTargets::console().stderr);
+    }
+
+    #[test]
+    fn stderr_switch_roundtrip() {
+        // Arrange: console behaviour by default.
+        let before = stderr_enabled();
+        // Act/assert: a GUI run can silence it, and restore it.
+        set_stderr_enabled(false);
+        assert!(!stderr_enabled());
+        set_stderr_enabled(true);
+        assert!(stderr_enabled());
+        // Leave the process as we found it (tests share process state).
+        set_stderr_enabled(before);
     }
 
     #[test]

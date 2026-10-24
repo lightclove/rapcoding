@@ -1,3 +1,11 @@
+// The GUI build must not open a console window: on Windows the process would
+// show a black console next to the app window (SC-gui-console). The console
+// build keeps the default subsystem so `rapcoding check`/`devices` and the
+// headless daemon still print to the terminal. Because a windowed process has
+// no stdout/stderr, the GUI path also routes log lines to the in-app log page
+// (see `cmd_gui` and `log::LogTargets`).
+#![cfg_attr(all(windows, feature = "gui"), windows_subsystem = "windows")]
+
 mod asr;
 mod audio;
 mod config;
@@ -209,6 +217,11 @@ fn cmd_run(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
 
 #[cfg(feature = "gui")]
 fn cmd_gui(cfg: Config, path: PathBuf, verbose: bool) -> Result<i32> {
+    // SC-gui-console: a GUI run has no console window. Silence every stray
+    // stderr write (audio stream errors bypass the logger) and route logger
+    // output to the in-app log page + log file only. Set before any thread
+    // spawns so the audio callback sees it.
+    log::set_stderr_enabled(false);
     let status = Arc::new(Mutex::new(Status::Idle));
     let live = LiveLog::new(500);
     let journal = Journal::new(config::config_dir().join("journal.log"));
@@ -297,10 +310,18 @@ impl Daemon {
         live: Option<LiveLog>,
         journal: &Journal,
     ) -> Result<Self> {
+        // A caller that supplied a live log is a GUI run (the window shows the
+        // log page): keep the console silent. Headless runs keep stderr.
+        let targets = if live.is_some() {
+            log::LogTargets::ui_only()
+        } else {
+            log::LogTargets::console()
+        };
         let init = sync::read_recover(&cfg).clone();
         let level = if verbose { Level::Debug } else { Level::Info };
         let log_path = config::config_dir().join("rapcoding.log");
-        let logger = Logger::new_with_live(log_path, level, transcripts, live)?;
+        let logger =
+            Logger::new_with_live_in(log_path, level, transcripts, live, targets)?;
         logger.info(&format!(
             "rapcoding {VERSION} starting; config {}",
             path.display()

@@ -249,13 +249,12 @@ where
             let last = last_err.load(Ordering::Relaxed);
             if now.saturating_sub(last) >= 2 {
                 last_err.store(now, Ordering::Relaxed);
-                // Fallible write: a broken stderr pipe must not panic the audio thread.
-                crate::log::write_line(
-                    &mut std::io::stderr(),
-                    &format!(
-                        "{}",
-                        crate::log::sanitize(&human_stream_error(&e))
-                    ),
+                // Fallible write: a broken stderr pipe must not panic the audio
+                // thread. In a GUI run there is no console, so this stays silent
+                // there (the message still goes to the log file).
+                crate::log::write_line_if(
+                    crate::log::stderr_enabled(),
+                    &format!("{}", crate::log::sanitize(&human_stream_error(&e))),
                 );
             }
         }
