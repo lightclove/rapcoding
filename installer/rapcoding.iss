@@ -43,28 +43,28 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 
 [Types]
-Name: "gui"; Description: "С интерфейсом + лёгкие модели (рекомендуется)"
-Name: "console"; Description: "Консольная + лёгкие модели"
-Name: "full"; Description: "С интерфейсом + тяжёлые модели"
+Name: "light"; Description: "Лёгкие модели (рекомендуется)"
+Name: "heavy"; Description: "Тяжёлые модели (точнее)"
 Name: "custom"; Description: "Выборочная установка"; Flags: iscustom
 
 [Components]
-; Version: one checkbox — checked = GUI, unchecked = console-only.
-Name: "gui"; Description: "Графический интерфейс (снимите отметку — только консоль)"; Types: gui full custom
-; Models: only recorded here; downloaded by the app on first launch.
-Name: "ru_light"; Description: "Русская модель — лёгкая (~44 МБ)"; Types: gui console custom
-Name: "ru_heavy"; Description: "Русская модель — тяжёлая (~1.8 ГБ, точнее)"; Types: full custom
-Name: "en_light"; Description: "Английская модель — лёгкая (~39 МБ)"; Types: gui console custom
-Name: "en_heavy"; Description: "Английская модель — тяжёлая (~1.8 ГБ, точнее)"; Types: full custom
+; Both binaries are always installed; the Start Menu offers two entries:
+; «интерфейс» (window with in-app log) and «консоль» (plain console).
+Name: "ru_light"; Description: "Русская модель — лёгкая (~44 МБ)"; Types: light custom
+Name: "ru_heavy"; Description: "Русская модель — тяжёлая (~1.8 ГБ, точнее)"; Types: heavy custom
+Name: "en_light"; Description: "Английская модель — лёгкая (~39 МБ)"; Types: light custom
+Name: "en_heavy"; Description: "Английская модель — тяжёлая (~1.8 ГБ, точнее)"; Types: heavy custom
 
 [Tasks]
-Name: "startmenu"; Description: "Создать ярлык в меню «Пуск»"; GroupDescription: "Ярлыки:"
+Name: "startmenu"; Description: "Создать ярлыки в меню «Пуск» (интерфейс и консоль)"; GroupDescription: "Ярлыки:"
 ; Windows 10/11 запрещает программное закрепление — попытка best-effort, не блокирует установку.
-Name: "taskbar"; Description: "Закрепить в панели задач (может не сработать на Windows 10/11)"; GroupDescription: "Ярлыки:"; Flags: unchecked
+Name: "taskbar"; Description: "Закрепить окно программы в панели задач (может не сработать на Windows 10/11)"; GroupDescription: "Ярлыки:"; Flags: unchecked
 
 [Files]
-Source: "..\target\release\rapcoding-gui.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Check: IsComponentSelected('gui'); Flags: ignoreversion
-Source: "..\target\release\rapcoding-console.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Check: not IsComponentSelected('gui'); Flags: ignoreversion
+; GUI build becomes the main rapcoding.exe (window + in-app log, no console);
+; the console build ships side by side under its own name.
+Source: "..\target\release\rapcoding-gui.exe"; DestDir: "{app}"; DestName: "rapcoding.exe"; Flags: ignoreversion
+Source: "..\target\release\rapcoding-console.exe"; DestDir: "{app}"; DestName: "rapcoding-console.exe"; Flags: ignoreversion
 Source: "..\target\release\libvosk.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\libgcc_s_seh-1.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\target\release\libstdc++-6.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -72,11 +72,14 @@ Source: "..\target\release\libwinpthread-1.dll"; DestDir: "{app}"; Flags: ignore
 Source: "pin-taskbar.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startmenu
+; Two separate Start Menu entries: the window variant (forced --gui so the
+; window opens even when gui.enabled=false in the config) and the plain console.
+Name: "{group}\rapcoding (интерфейс)"; Filename: "{app}\rapcoding.exe"; Parameters: "--gui"; Tasks: startmenu
+Name: "{group}\rapcoding (консоль)"; Filename: "{app}\rapcoding-console.exe"; Tasks: startmenu
 
 [Run]
 Filename: "powershell.exe"; \
-    Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\pin-taskbar.ps1"" -Target ""{app}\{#MyAppExeName}"""; \
+    Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\pin-taskbar.ps1"" -Target ""{app}\rapcoding.exe"""; \
     Tasks: taskbar; Flags: runhidden
 
 [Code]
