@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -57,6 +57,88 @@ pub fn stderr_enabled() -> bool {
 
 pub fn set_stderr_enabled(enabled: bool) {
     STDERR_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// A tiny, allocation-light sink for messages produced on the real-time audio
+/// thread (WASAPI xrun/device errors).
+///
+/// It deliberately does NOT use `Logger`: that holds a mutex, and the audio
+/// callback must never block on one. Instead it
+///   * rate-limits bursts with a single atomic timestamp (one line per ~2 s),
+///   * mirrors the line to stderr only when a console exists
+///     (`LogTargets::stderr`), and
+///   * keeps the last lines in memory so the GUI log page can show them, plus
+///     appends to the log file so a GUI run still has them on disk.
+pub struct ErrorSink {
+    targets: LogTargets,
+    last: Arc<AtomicU64>, // unix seconds of the last accepted line
+    recent: LiveLog,
+    file: Mutex<Option<File>>,
+    path: PathBuf,
+}
+
+impl ErrorSink {
+    pub fn new(path: PathBuf, targets: LogTargets) -> Result<Self> {
+        Self::new_with_live(path, targets, None)
+    }
+
+    /// `live` lets the GUI reuse the same buffer it renders on the log page,
+    /// so audio-thread messages appear there interleaved with daemon lines.
+    pub fn new_with_live(
+        path: PathBuf,
+        targets: LogTargets,
+        live: Option<LiveLog>,
+    ) -> Result<Self> {
+        if let Some(p) = path.parent() {
+            let _ = fs::create_dir_all(p);
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map(Some)?;
+        Ok(ErrorSink {
+            targets,
+            last: Arc::new(AtomicU64::new(0)),
+            recent: live.unwrap_or_else(|| LiveLog::new(64)),
+            file: Mutex::new(file),
+            path,
+        })
+    }
+
+    /// Record one audio-thread message. Safe to call from a real-time thread:
+    /// the only blocking part is the file write, and it happens at most once
+    /// per rate-limit window.
+    pub fn report(&self, msg: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self.last.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 2 {
+            return;
+        }
+        self.last.store(now, Ordering::Relaxed);
+
+        let line = msg.to_string();
+        write_line_if(self.targets.stderr, &line);
+        self.recent.push(&line);
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(f) = guard.as_mut() {
+                write_line(f, &line);
+                let _ = f.flush();
+            }
+        }
+    }
+
+    /// Oldest-first lines captured so far (for the GUI log page).
+    pub fn snapshot(&self) -> Vec<String> {
+        self.recent.snapshot()
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 #[derive(Clone)]
@@ -232,7 +314,6 @@ pub struct LiveLog {
 }
 
 impl LiveLog {
-    #[cfg(feature = "gui")]
     pub fn new(cap: usize) -> Self {
         LiveLog {
             inner: Arc::new(Mutex::new(VecDeque::new())),
@@ -250,7 +331,6 @@ impl LiveLog {
     }
 
     /// Oldest-first snapshot of the buffered lines.
-    #[cfg(feature = "gui")]
     pub fn snapshot(&self) -> Vec<String> {
         crate::sync::lock_recover(&self.inner)
             .iter()

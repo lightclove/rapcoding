@@ -321,7 +321,7 @@ impl Daemon {
         let level = if verbose { Level::Debug } else { Level::Info };
         let log_path = config::config_dir().join("rapcoding.log");
         let logger =
-            Logger::new_with_live_in(log_path, level, transcripts, live, targets)?;
+            Logger::new_with_live_in(log_path, level, transcripts, live.clone(), targets)?;
         logger.info(&format!(
             "rapcoding {VERSION} starting; config {}",
             path.display()
@@ -329,7 +329,20 @@ impl Daemon {
         journal.append("session", &format!("start; config {}", path.display()));
 
         let mode = parse_mode(&init.general.mode)?;
-        let audio = audio::AudioCapture::new(&init.audio.device)?;
+        // GUI runs have no console window: audio-thread messages (xrun, device
+        // lost) go to the in-app log page and the log file instead of stderr.
+        // Reuse the GUI log buffer so audio-thread lines show up on the log
+        // page next to daemon lines.
+        let err_sink = if let Some(buf) = live.clone() {
+            Some(Arc::new(log::ErrorSink::new_with_live(
+                config::config_dir().join("audio-errors.log"),
+                log::LogTargets::ui_only(),
+                Some(buf),
+            )?))
+        } else {
+            None
+        };
+        let audio = audio::AudioCapture::new_with_sink(&init.audio.device, err_sink)?;
         logger.info(&format!(
             "audio device '{}' {} Hz {} ch",
             audio.device_name(),

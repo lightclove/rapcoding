@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -27,6 +27,15 @@ pub struct AudioCapture {
 
 impl AudioCapture {
     pub fn new(device_filter: &str) -> Result<Self> {
+        Self::new_with_sink(device_filter, None)
+    }
+
+    /// `sink` carries audio-thread messages to the console (headless) or to
+    /// the in-app log page and file (GUI run, no console window).
+    pub fn new_with_sink(
+        device_filter: &str,
+        sink: Option<Arc<crate::log::ErrorSink>>,
+    ) -> Result<Self> {
         let device = resolve_input_device(device_filter)?;
         let device_name = device.to_string();
         let supported = device
@@ -47,13 +56,13 @@ impl AudioCapture {
 
         let stream = match sample_format {
             SampleFormat::F32 => {
-                build_stream::<f32>(&device, config, shared.clone(), channels, downmix_f32)?
+                build_stream::<f32>(&device, config, shared.clone(), channels, downmix_f32, sink.clone())?
             }
             SampleFormat::I16 => {
-                build_stream::<i16>(&device, config, shared.clone(), channels, downmix_i16)?
+                build_stream::<i16>(&device, config, shared.clone(), channels, downmix_i16, sink.clone())?
             }
             SampleFormat::U16 => {
-                build_stream::<u16>(&device, config, shared.clone(), channels, downmix_u16)?
+                build_stream::<u16>(&device, config, shared.clone(), channels, downmix_u16, sink.clone())?
             }
             other => {
                 return Err(Error::Audio(format!("unsupported sample format {other:?}")));
@@ -230,33 +239,21 @@ fn build_stream<T>(
     shared: Arc<Shared>,
     channels: u16,
     convert: fn(&[T], usize) -> Vec<f32>,
+    sink: Option<Arc<crate::log::ErrorSink>>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample + Send + 'static,
 {
     let s = shared.clone();
     let ch = channels as usize;
-    // Rate-limit stream errors: a WASAPI buffer underrun/overrun is non-fatal
-    // and can fire in bursts, but one line per ~2 s is enough signal.
-    let last_err = Arc::new(AtomicU64::new(0));
-    let err = {
-        let last_err = last_err.clone();
-        move |e: cpal::Error| {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let last = last_err.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= 2 {
-                last_err.store(now, Ordering::Relaxed);
-                // Fallible write: a broken stderr pipe must not panic the audio
-                // thread. In a GUI run there is no console, so this stays silent
-                // there (the message still goes to the log file).
-                crate::log::write_line_if(
-                    crate::log::stderr_enabled(),
-                    &format!("{}", crate::log::sanitize(&human_stream_error(&e))),
-                );
-            }
+    // Audio-thread errors are rate-limited and routed through the sink: to the
+    // console in a headless run, and to the in-app log page + log file in a GUI
+    // run (which has no console window). Without a sink they go to stderr.
+    let err = move |e: cpal::Error| {
+        let msg = format!("{}", crate::log::sanitize(&human_stream_error(&e)));
+        match &sink {
+            Some(s) => s.report(&msg),
+            None => crate::log::write_line_if(crate::log::stderr_enabled(), &msg),
         }
     };
     let cb = move |data: &[T], _info: &cpal::InputCallbackInfo| {
@@ -492,6 +489,80 @@ mod tests {
         assert!(msg.contains("не портит"), "got: {msg}");
         // Must not leak the raw English backend text.
         assert!(!msg.contains("underrun"), "got: {msg}");
+    }
+
+    #[test]
+    fn stream_error_reaches_ui_log_and_file_but_not_console() {
+        // SC-gui-console: in a GUI run the audio thread has no console. The
+        // message must still be visible — via the in-app log page and the file.
+        let dir = std::env::temp_dir().join(format!("rapcoding-audio-sink-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("a.log");
+        let sink = crate::log::ErrorSink::new(path.clone(), crate::log::LogTargets::ui_only())
+            .expect("sink");
+        // Act: exactly what the real-time callback does.
+        sink.report("звук: прерывание потока записи (не ошибка)");
+        // Assert: the file got the line, and the in-app buffer has it too.
+        let on_disk = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(on_disk.contains("прерывание потока записи"), "file: {on_disk}");
+        assert_eq!(sink.snapshot().len(), 1, "UI buffer must have the line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn error_sink_rate_limits_bursts() {
+        // A WASAPI xrun can fire in bursts; one line per ~2 s is enough.
+        let dir = std::env::temp_dir().join(format!("rapcoding-audio-rl-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sink = crate::log::ErrorSink::new(dir.join("b.log"), crate::log::LogTargets::ui_only())
+            .expect("sink");
+        for _ in 0..20 {
+            sink.report("spam");
+        }
+        assert_eq!(sink.snapshot().len(), 1, "bursts must be rate-limited");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn error_sink_survives_concurrent_callers() {
+        // The rate-limit state must be atomic: callers must never deadlock or
+        // double-log because of interleaving.
+        let path = std::env::temp_dir().join("rapcoding-audio-conc.log");
+        let sink = crate::log::ErrorSink::new(path.clone(), crate::log::LogTargets::ui_only())
+            .expect("sink");
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..50 {
+                        sink.report("concurrent");
+                    }
+                });
+            }
+        });
+        assert!(sink.snapshot().len() <= 1, "got {}", sink.snapshot().len());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sink_shares_the_gui_buffer_when_given_one() {
+        // The GUI renders its own LiveLog; the sink must write into THAT buffer
+        // (a clone shares the Arc), otherwise audio errors never show on the
+        // log page even though the file has them.
+        let path = std::env::temp_dir().join(format!("rapcoding-sink-share-{}.log", std::process::id()));
+        let gui_buf = crate::log::LiveLog::new(500);
+        let sink = crate::log::ErrorSink::new_with_live(
+            path.clone(),
+            crate::log::LogTargets::ui_only(),
+            Some(gui_buf.clone()),
+        )
+        .expect("sink");
+        sink.report("звук: тестовая строка");
+        assert!(
+            gui_buf.snapshot().iter().any(|l| l.contains("тестовая строка")),
+            "the GUI buffer must receive it: {:?}",
+            gui_buf.snapshot()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
