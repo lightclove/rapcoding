@@ -253,8 +253,8 @@ where
                 crate::log::write_line(
                     &mut std::io::stderr(),
                     &format!(
-                        "audio stream error: {}",
-                        crate::log::sanitize(&e.to_string())
+                        "{}",
+                        crate::log::sanitize(&human_stream_error(&e))
                     ),
                 );
             }
@@ -270,6 +270,42 @@ where
     device
         .build_input_stream(config, cb, err, None)
         .map_err(|e| Error::Audio(format!("build input stream: {e}")))
+}
+
+/// A user-facing message for an audio stream error. Technical detail is kept
+/// (it is the only way to diagnose), but the sentence says what it means and
+/// whether the user has to do anything.
+fn human_stream_error(e: &cpal::Error) -> String {
+    use cpal::ErrorKind;
+    match e.kind() {
+        ErrorKind::Xrun => "звук: прерывание потока записи (не ошибка) — \
+             звуковая карта не успела отдать буфер. Обычно бывает в момент \
+             подключения или переключения устройства и записи не портит."
+            .into(),
+        ErrorKind::DeviceNotAvailable | ErrorKind::DeviceChanged => {
+            "звук: микрофон пропал или сменился (отключили гарнитуру?). \
+             Выберите устройство заново на странице «Звук» и перезапустите программу."
+                .into()
+        }
+        ErrorKind::DeviceBusy => {
+            "звук: микрофон занят другой программой. Закройте её или \
+             выберите другое устройство на странице «Звук»."
+                .into()
+        }
+        ErrorKind::PermissionDenied => {
+            "звук: Windows запрещает доступ к микрофону. Разрешите его в \
+             Параметрах: Конфиденциальность, Микрофон."
+                .into()
+        }
+        ErrorKind::StreamInvalidated => {
+            "звук: поток записи устарел — перезапустите программу.".into()
+        }
+        other => format!(
+            "звук: проблема с потоком записи ({}). Если запись не работает — \
+             перезапустите программу.",
+            crate::log::sanitize(&other.to_string())
+        ),
+    }
 }
 
 fn downmix_f32(data: &[f32], channels: usize) -> Vec<f32> {
@@ -446,6 +482,33 @@ mod tests {
             channels: None,
         };
         assert_eq!(d.summary(), "");
+    }
+
+    #[test]
+    fn xrun_message_is_reassuring_and_not_scary() {
+        let e = cpal::Error::new(cpal::ErrorKind::Xrun);
+        let msg = human_stream_error(&e);
+        // Says it is not an error and that recording is unaffected.
+        assert!(msg.contains("не ошибка"), "got: {msg}");
+        assert!(msg.contains("не портит"), "got: {msg}");
+        // Must not leak the raw English backend text.
+        assert!(!msg.contains("underrun"), "got: {msg}");
+    }
+
+    #[test]
+    fn device_lost_message_tells_what_to_do() {
+        let e = cpal::Error::new(cpal::ErrorKind::DeviceNotAvailable);
+        let msg = human_stream_error(&e);
+        assert!(msg.contains("Звук"), "got: {msg}");
+        assert!(msg.contains("перезапустите"), "got: {msg}");
+    }
+
+    #[test]
+    fn busy_and_permission_messages_are_human() {
+        let busy = human_stream_error(&cpal::Error::new(cpal::ErrorKind::DeviceBusy));
+        assert!(busy.contains("занят"), "got: {busy}");
+        let denied = human_stream_error(&cpal::Error::new(cpal::ErrorKind::PermissionDenied));
+        assert!(denied.contains("Конфиденциальность"), "got: {denied}");
     }
 
     #[test]
