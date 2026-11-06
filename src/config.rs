@@ -170,9 +170,9 @@ impl Default for Inject {
 impl Default for Cloud {
     fn default() -> Self {
         Cloud {
-            base_url: "https://api.groq.com/openai/v1".into(),
+            base_url: "https://api.proxyapi.ru/v1".into(),
             api_key: String::new(),
-            model: "whisper-large-v3".into(),
+            model: "openai/whisper-large-v3-turbo".into(),
         }
     }
 }

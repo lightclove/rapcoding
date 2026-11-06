@@ -36,11 +36,11 @@ settle_ms = 300            # wait after paste before restoring the clipboard
 
 [cloud]
 # Cloud ASR for the interview binding only: understands RU+EN mixed speech.
-# Any OpenAI-compatible endpoint works (/audio/transcriptions). Regular
-# hotkeys stay fully local (vosk) and never leave the machine.
-base_url = "https://api.groq.com/openai/v1"  # OpenAI-compatible root; any provider works (Groq, OpenAI, Deepgram)
+# ProxyAPI (Russian reseller, ruble payments, no VPN) is the default.
+# Regular hotkeys stay fully local (vosk) and never leave the machine.
+base_url = "https://api.proxyapi.ru/v1"  # OpenAI-compatible root
 api_key = ""               # empty = cloud disabled (interview binding not registered)
-model = "whisper-large-v3"
+model = "openai/whisper-large-v3-turbo"  # 0.03 rub/min; quality option: openai/gpt-4o-transcribe (1.55 rub/min)
 
 [gui]
 enabled = true             # false = console-only mode (no window)

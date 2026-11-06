@@ -70,9 +70,9 @@ pub const SETTINGS_FIELDS: &[FieldMeta] = &[
     FieldMeta { id: "inject.paste_shortcut", label: "Свой шорткат вставки", hint: "Пусто — ctrl+v; например ctrl+shift+v для терминалов", kind: WidgetKind::Text, restart: true },
     FieldMeta { id: "inject.restore_clipboard", label: "Восстанавливать буфер", hint: "После вставки вернуть прежнее содержимое буфера обмена", kind: WidgetKind::Bool, restart: true },
     FieldMeta { id: "inject.settle_ms", label: "Пауза после вставки, мс", hint: "Ожидание перед восстановлением буфера", kind: WidgetKind::UInt { min: 0, max: 10000 }, restart: true },
-    FieldMeta { id: "cloud.base_url", label: "Адрес облака (API)", hint: "OpenAI-совместимый адрес, например https://api.groq.com/openai/v1. Нужен только для хоткея интервью", kind: WidgetKind::Text, restart: true },
+    FieldMeta { id: "cloud.base_url", label: "Адрес облака (API)", hint: "OpenAI-совместимый адрес, по умолчанию https://api.proxyapi.ru/v1 (рубли, без VPN). Нужен только для хоткея интервью", kind: WidgetKind::Text, restart: true },
     FieldMeta { id: "cloud.api_key", label: "Ключ облака (API)", hint: "Пусто — облако выключено, хоткей интервью не регистрируется. Ключ никуда не отправляется, кроме этого адреса", kind: WidgetKind::Secret, restart: true },
-    FieldMeta { id: "cloud.model", label: "Модель облака", hint: "Например whisper-large-v3 (Groq); любая модель выбранного провайдера", kind: WidgetKind::Text, restart: true },
+    FieldMeta { id: "cloud.model", label: "Модель облака", hint: "openai/whisper-large-v3-turbo (0,03 ₽/мин) или openai/gpt-4o-transcribe (1,55 ₽/мин, лучше для смеси языков)", kind: WidgetKind::Text, restart: true },
     FieldMeta { id: "gui.enabled", label: "Окно при запуске", hint: "Выключено — консольный режим: окно не откроется при старте (вернуть: rapcoding --gui)", kind: WidgetKind::Bool, restart: true },
     FieldMeta { id: "gui.theme", label: "Тема", hint: "Переключается и в шапке окна", kind: WidgetKind::Choice(&["light", "dark"]), restart: false },
 ];
