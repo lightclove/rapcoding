@@ -5,12 +5,14 @@
 mode = "hold"              # "hold" (push-to-talk) | "toggle"
 hotkey = "ctrl+alt+space"  # global hotkey for the Russian model (e.g. "f9", "ctrl+shift+f10")
 en_hotkey = "ctrl+win+alt+space"  # global hotkey for the English model ("win" = Windows/Command key)
+interview_hotkey = "ctrl+alt+shift+space"  # third binding: ALL input devices + system audio (loopback) -> cloud ASR (mixed RU/EN); empty = feature off
 max_record_secs = 120      # hard stop to avoid runaway recording
 log_transcripts = false    # privacy: keep recognized text out of the log
 
 [audio]
 device = ""                # empty = system default input; otherwise the exact device name
                             # (or a substring of it) — pick it in the GUI «Звук» page or `rapcoding devices`
+loopback_device = ""       # output device captured for the interview binding (system audio). Empty = system default output
 silence_threshold = 0.008  # abs sample value below this is treated as silence (0.0..1.0)
 silence_padding_ms = 200   # silence kept around detected speech
 min_speech_ms = 250        # reject shorter utterances as noise
@@ -31,6 +33,14 @@ method = "paste"           # "paste" | "type"
 paste_shortcut = ""        # empty = platform default (ctrl+v / cmd+v); e.g. "ctrl+shift+v" for terminals
 restore_clipboard = true
 settle_ms = 300            # wait after paste before restoring the clipboard
+
+[cloud]
+# Cloud ASR for the interview binding only: understands RU+EN mixed speech.
+# Any OpenAI-compatible endpoint works (/audio/transcriptions). Regular
+# hotkeys stay fully local (vosk) and never leave the machine.
+base_url = "https://api.groq.com/openai/v1"  # OpenAI-compatible root; any provider works (Groq, OpenAI, Deepgram)
+api_key = ""               # empty = cloud disabled (interview binding not registered)
+model = "whisper-large-v3"
 
 [gui]
 enabled = true             # false = console-only mode (no window)

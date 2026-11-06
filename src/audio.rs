@@ -15,6 +15,14 @@ struct Shared {
     start: Mutex<Option<Instant>>,
 }
 
+/// Whether the captured device is a capture (mic) or render (loopback)
+/// endpoint. WASAPI loopback is opened as an input stream on a render device
+/// (cpal sets `AUDCLNT_STREAMFLAGS_LOOPBACK` for render endpoints).
+enum Flow {
+    In,
+    Out,
+}
+
 /// A persistent input stream that collects mono samples only while recording.
 /// Held on the main thread; the audio callback pushes into `Shared`.
 pub struct AudioCapture {
@@ -37,10 +45,35 @@ impl AudioCapture {
         sink: Option<Arc<crate::log::ErrorSink>>,
     ) -> Result<Self> {
         let device = resolve_input_device(device_filter)?;
+        Self::from_device(device, Flow::In, sink)
+    }
+
+    /// Capture the system audio (WASAPI loopback) from an output device.
+    /// Empty filter = the system default output device.
+    pub fn new_loopback_with_sink(
+        device_filter: &str,
+        sink: Option<Arc<crate::log::ErrorSink>>,
+    ) -> Result<Self> {
+        let device = resolve_output_device(device_filter)?;
+        Self::from_device(device, Flow::Out, sink)
+    }
+
+    /// Common constructor: open `device` as a recording stream. For a render
+    /// device cpal transparently enables loopback mode.
+    fn from_device(
+        device: cpal::Device,
+        flow: Flow,
+        sink: Option<Arc<crate::log::ErrorSink>>,
+    ) -> Result<Self> {
         let device_name = device.to_string();
-        let supported = device
-            .default_input_config()
-            .map_err(|e| Error::Audio(format!("default input config: {e}")))?;
+        let supported = match flow {
+            Flow::In => device
+                .default_input_config()
+                .map_err(|e| Error::Audio(format!("default input config: {e}"))),
+            Flow::Out => device
+                .default_output_config()
+                .map_err(|e| Error::Audio(format!("default output config: {e}"))),
+        }?;
         let sample_format = supported.sample_format();
         let channels = supported.channels();
         let device_rate = supported.sample_rate();
@@ -233,6 +266,138 @@ pub fn resolve_input_device(filter: &str) -> Result<cpal::Device> {
     }
 }
 
+/// Resolve the configured `audio.loopback_device` filter to a concrete
+/// output device. Empty filter = system default output. A filter matching
+/// nothing is an error (same loud contract as the microphone).
+pub fn resolve_output_device(filter: &str) -> Result<cpal::Device> {
+    let host = cpal::default_host();
+    if filter.is_empty() {
+        return host
+            .default_output_device()
+            .ok_or_else(|| Error::Audio("no default output device".into()));
+    }
+    let mut devices: Vec<(cpal::Device, String)> = Vec::new();
+    for d in host
+        .output_devices()
+        .map_err(|e| Error::Audio(format!("enumerate output devices: {e}")))?
+    {
+        let name = d.to_string();
+        devices.push((d, name));
+    }
+    let names: Vec<String> = devices.iter().map(|(_, n)| n.clone()).collect();
+    match pick_index(filter, &names) {
+        Some(i) => Ok(devices[i].0.clone()),
+        None => Err(Error::Audio(format!("no output device matching '{filter}'"))),
+    }
+}
+
+/// Report an audio problem through the sink (GUI) or stderr (headless), never
+/// silently. Shared by the real-time callback and the multi-capture opener.
+pub fn report_audio_error(sink: &Option<Arc<crate::log::ErrorSink>>, msg: &str) {
+    let msg = format!("{}", crate::log::sanitize(msg));
+    match sink {
+        Some(s) => s.report(&msg),
+        None => crate::log::write_line_if(crate::log::stderr_enabled(), &msg),
+    }
+}
+
+/// Capture from every input device plus the loopback stream at once.
+/// Devices that fail to open are reported loudly and skipped; the capture
+/// continues with the rest (degradation contract for the interview binding).
+pub struct MultiCapture {
+    streams: Vec<AudioCapture>,
+}
+
+impl MultiCapture {
+    /// Open all input devices and the loopback stream (empty filter = system
+    /// default output). Fails only when nothing at all could be opened.
+    pub fn open_all(
+        loopback_filter: &str,
+        sink: Option<Arc<crate::log::ErrorSink>>,
+    ) -> Result<Self> {
+        let host = cpal::default_host();
+        let mut streams: Vec<AudioCapture> = Vec::new();
+        for d in host
+            .input_devices()
+            .map_err(|e| Error::Audio(format!("enumerate input devices: {e}")))?
+        {
+            let name = d.to_string();
+            match AudioCapture::from_device(d, Flow::In, sink.clone()) {
+                Ok(s) => streams.push(s),
+                Err(e) => report_audio_error(&sink, &format!("звук: пропускаю устройство '{name}': {e}")),
+            }
+        }
+        match resolve_output_device(loopback_filter) {
+            Ok(d) => {
+                let name = d.to_string();
+                match AudioCapture::from_device(d, Flow::Out, sink.clone()) {
+                    Ok(s) => streams.push(s),
+                    Err(e) => report_audio_error(
+                        &sink,
+                        &format!("звук: пропускаю системный вывод '{name}': {e}"),
+                    ),
+                }
+            }
+            Err(e) => report_audio_error(&sink, &format!("звук: системный вывод недоступен: {e}")),
+        }
+        if streams.is_empty() {
+            return Err(Error::Audio(
+                "no capturable audio device (mic or loopback)".into(),
+            ));
+        }
+        Ok(MultiCapture { streams })
+    }
+
+    pub fn start(&self) {
+        for s in &self.streams {
+            s.start();
+        }
+    }
+
+    /// Stop every stream and mix the captured chunks to 16 kHz mono.
+    pub fn stop(&self) -> Vec<f32> {
+        let mut chunks: Vec<Vec<f32>> = Vec::new();
+        let mut rates: Vec<u32> = Vec::new();
+        for s in &self.streams {
+            let c = s.stop();
+            if !c.is_empty() {
+                chunks.push(c);
+                rates.push(s.device_rate());
+            }
+        }
+        mix_mono(&chunks, &rates)
+    }
+
+    /// Longest running stream wins (they start together).
+    pub fn elapsed(&self) -> Option<Duration> {
+        self.streams.iter().filter_map(|s| s.elapsed()).max()
+    }
+}
+
+/// Mix per-device mono chunks to `ASR_RATE`: resample, pad the shorter ones
+/// with zeros, sum, and peak-normalize only on overflow (a single quiet
+/// device must not be attenuated by summing silent streams).
+pub fn mix_mono(chunks: &[Vec<f32>], rates: &[u32]) -> Vec<f32> {
+    let mut out: Vec<f32> = Vec::new();
+    for (chunk, rate) in chunks.iter().zip(rates) {
+        let r = resample(chunk, *rate, crate::asr::ASR_RATE);
+        if r.len() > out.len() {
+            out.resize(r.len(), 0.0);
+        }
+        for (o, s) in out.iter_mut().zip(&r) {
+            *o += s;
+        }
+    }
+    let peak = out.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    if peak > 0.95 {
+        let k = 0.95 / peak;
+        for x in &mut out {
+            *x *= k;
+        }
+    }
+    out
+}
+
 fn build_stream<T>(
     device: &cpal::Device,
     config: StreamConfig,
@@ -250,11 +415,8 @@ where
     // console in a headless run, and to the in-app log page + log file in a GUI
     // run (which has no console window). Without a sink they go to stderr.
     let err = move |e: cpal::Error| {
-        let msg = format!("{}", crate::log::sanitize(&human_stream_error(&e)));
-        match &sink {
-            Some(s) => s.report(&msg),
-            None => crate::log::write_line_if(crate::log::stderr_enabled(), &msg),
-        }
+        let msg = human_stream_error(&e);
+        report_audio_error(&sink, &msg);
     };
     let cb = move |data: &[T], _info: &cpal::InputCallbackInfo| {
         if !s.recording.load(Ordering::Relaxed) {
@@ -609,6 +771,68 @@ mod tests {
         let stereo = vec![0.0f32, 1.0, 0.0, 1.0];
         let mono = downmix_f32(&stereo, 2);
         assert_eq!(mono, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn mix_mono_sums_equal_length_chunks() {
+        let a = vec![0.2f32, 0.2];
+        let b = vec![0.3f32, 0.3];
+        let out = mix_mono(&[a, b], &[16_000, 16_000]);
+        assert_eq!(out.len(), 2);
+        for x in out {
+            assert!((x - 0.5).abs() < 1e-5, "got {x}");
+        }
+    }
+
+    #[test]
+    fn mix_mono_pads_shorter_chunk_with_zeros() {
+        // Below the normalization threshold so sums stay untouched.
+        let a = vec![0.4f32, 0.4, 0.4];
+        let b = vec![0.4f32];
+        let out = mix_mono(&[a, b], &[16_000, 16_000]);
+        assert_eq!(out.len(), 3);
+        assert!((out[0] - 0.8).abs() < 1e-5, "got {}", out[0]);
+        assert!((out[1] - 0.4).abs() < 1e-5, "got {}", out[1]);
+        assert!((out[2] - 0.4).abs() < 1e-5, "got {}", out[2]);
+    }
+
+    #[test]
+    fn mix_mono_peak_normalizes_on_overflow() {
+        let a = vec![1.0f32; 4];
+        let b = vec![1.0f32; 4];
+        let out = mix_mono(&[a, b], &[16_000, 16_000]);
+        for x in out {
+            assert!(x <= 0.95 + 1e-5, "got {x}");
+            assert!(x > 0.9, "got {x}");
+        }
+    }
+
+    #[test]
+    fn mix_mono_single_quiet_device_is_not_attenuated() {
+        // A lone device at low volume must keep its level: summing silent
+        // streams must not rescale it (peak is well below 0.95).
+        let a = vec![0.1f32; 8];
+        let b = vec![0.0f32; 8];
+        let out = mix_mono(&[a, b], &[16_000, 16_000]);
+        for x in out {
+            assert!((x - 0.1).abs() < 1e-5, "got {x}");
+        }
+    }
+
+    #[test]
+    fn mix_mono_empty_input_is_empty() {
+        assert!(mix_mono(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn mix_mono_resamples_to_asr_rate() {
+        // 48 kHz stereo captured at 48k → 16 kHz mono mix.
+        let a = vec![0.25f32; 48_000];
+        let out = mix_mono(&[a], &[48_000]);
+        assert_eq!(out.len(), crate::asr::ASR_RATE as usize);
+        for &x in &out {
+            assert!((x - 0.25).abs() < 1e-4);
+        }
     }
 
     #[test]

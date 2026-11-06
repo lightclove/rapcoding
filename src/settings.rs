@@ -25,6 +25,9 @@ pub enum WidgetKind {
         max: u64,
     },
     Text,
+    /// Like Text but rendered masked (API keys). The value itself is never
+    /// echoed to the screen.
+    Secret,
     Hotkey,
     /// Filesystem directory; rendered as a text field + «Выбрать…» dialog.
     Dir,
@@ -48,9 +51,11 @@ pub const SETTINGS_FIELDS: &[FieldMeta] = &[
     FieldMeta { id: "general.mode", label: "Режим записи", hint: "hold — запись, пока держите хоткей; toggle — одно нажатие включает, второе выключает", kind: WidgetKind::Choice(&["hold", "toggle"]), restart: true },
     FieldMeta { id: "general.hotkey", label: "Хоткей (русский)", hint: "Например: f9, ctrl+alt+space. Клавишу Win виджет захвата не ловит — впишите вручную", kind: WidgetKind::Hotkey, restart: true },
     FieldMeta { id: "general.en_hotkey", label: "Хоткей (английский)", hint: "Должен отличаться от русского хоткея", kind: WidgetKind::Hotkey, restart: true },
+    FieldMeta { id: "general.interview_hotkey", label: "Хоткей (интервью)", hint: "Запись всех устройств + системный звук → облачное распознавание (русский+английский). Пусто — функция выключена", kind: WidgetKind::Hotkey, restart: true },
     FieldMeta { id: "general.max_record_secs", label: "Макс. длительность записи, с", hint: "Авто-остановка, чтобы запись не шла бесконечно", kind: WidgetKind::UInt { min: 1, max: 3600 }, restart: false },
     FieldMeta { id: "general.log_transcripts", label: "Писать расшифровки в лог", hint: "Приватность: по умолчанию текст распознавания в лог не попадает", kind: WidgetKind::Bool, restart: false },
     FieldMeta { id: "audio.device", label: "Устройство ввода", hint: "Пусто — системное по умолчанию; иначе подстрока имени. Удобный выбор — на странице «Звук»", kind: WidgetKind::Text, restart: true },
+    FieldMeta { id: "audio.loopback_device", label: "Системный звук (интервью)", hint: "Устройство вывода, с которого пишется системный звук для хоткея интервью. Пусто — вывод по умолчанию. Выбор — на странице «Звук»", kind: WidgetKind::Text, restart: true },
     FieldMeta { id: "audio.silence_threshold", label: "Порог тишины", hint: "Доля амплитуды 0..1: тише — считается тишиной", kind: WidgetKind::Float { min: 0.0, max: 0.999 }, restart: false },
     FieldMeta { id: "audio.silence_padding_ms", label: "Паузы вокруг речи, мс", hint: "Сколько тишины оставлять по краям фразы", kind: WidgetKind::UInt { min: 0, max: 5000 }, restart: false },
     FieldMeta { id: "audio.min_speech_ms", label: "Минимум речи, мс", hint: "Более короткие звуки отбрасываются как шум", kind: WidgetKind::UInt { min: 0, max: 60000 }, restart: false },
@@ -65,6 +70,9 @@ pub const SETTINGS_FIELDS: &[FieldMeta] = &[
     FieldMeta { id: "inject.paste_shortcut", label: "Свой шорткат вставки", hint: "Пусто — ctrl+v; например ctrl+shift+v для терминалов", kind: WidgetKind::Text, restart: true },
     FieldMeta { id: "inject.restore_clipboard", label: "Восстанавливать буфер", hint: "После вставки вернуть прежнее содержимое буфера обмена", kind: WidgetKind::Bool, restart: true },
     FieldMeta { id: "inject.settle_ms", label: "Пауза после вставки, мс", hint: "Ожидание перед восстановлением буфера", kind: WidgetKind::UInt { min: 0, max: 10000 }, restart: true },
+    FieldMeta { id: "cloud.base_url", label: "Адрес облака (API)", hint: "OpenAI-совместимый адрес, например https://api.groq.com/openai/v1. Нужен только для хоткея интервью", kind: WidgetKind::Text, restart: true },
+    FieldMeta { id: "cloud.api_key", label: "Ключ облака (API)", hint: "Пусто — облако выключено, хоткей интервью не регистрируется. Ключ никуда не отправляется, кроме этого адреса", kind: WidgetKind::Secret, restart: true },
+    FieldMeta { id: "cloud.model", label: "Модель облака", hint: "Например whisper-large-v3 (Groq); любая модель выбранного провайдера", kind: WidgetKind::Text, restart: true },
     FieldMeta { id: "gui.enabled", label: "Окно при запуске", hint: "Выключено — консольный режим: окно не откроется при старте (вернуть: rapcoding --gui)", kind: WidgetKind::Bool, restart: true },
     FieldMeta { id: "gui.theme", label: "Тема", hint: "Переключается и в шапке окна", kind: WidgetKind::Choice(&["light", "dark"]), restart: false },
 ];
@@ -77,6 +85,7 @@ pub const SETTINGS_SECTIONS: &[(&str, &str)] = &[
     ("asr", "Модели распознавания"),
     ("text", "Обработка текста"),
     ("inject", "Ввод текста"),
+    ("cloud", "Облачное распознавание (интервью)"),
     ("gui", "Интерфейс"),
 ];
 
@@ -97,9 +106,11 @@ pub fn field_mut<'a>(cfg: &'a mut Config, id: &str) -> Option<FieldValue<'a>> {
         "general.mode" => FieldValue::Str(&mut cfg.general.mode),
         "general.hotkey" => FieldValue::Str(&mut cfg.general.hotkey),
         "general.en_hotkey" => FieldValue::Str(&mut cfg.general.en_hotkey),
+        "general.interview_hotkey" => FieldValue::Str(&mut cfg.general.interview_hotkey),
         "general.max_record_secs" => FieldValue::U64(&mut cfg.general.max_record_secs),
         "general.log_transcripts" => FieldValue::Bool(&mut cfg.general.log_transcripts),
         "audio.device" => FieldValue::Str(&mut cfg.audio.device),
+        "audio.loopback_device" => FieldValue::Str(&mut cfg.audio.loopback_device),
         "audio.silence_threshold" => FieldValue::F32(&mut cfg.audio.silence_threshold),
         "audio.silence_padding_ms" => FieldValue::U32(&mut cfg.audio.silence_padding_ms),
         "audio.min_speech_ms" => FieldValue::U32(&mut cfg.audio.min_speech_ms),
@@ -114,6 +125,9 @@ pub fn field_mut<'a>(cfg: &'a mut Config, id: &str) -> Option<FieldValue<'a>> {
         "inject.paste_shortcut" => FieldValue::Str(&mut cfg.inject.paste_shortcut),
         "inject.restore_clipboard" => FieldValue::Bool(&mut cfg.inject.restore_clipboard),
         "inject.settle_ms" => FieldValue::U64(&mut cfg.inject.settle_ms),
+        "cloud.base_url" => FieldValue::Str(&mut cfg.cloud.base_url),
+        "cloud.api_key" => FieldValue::Str(&mut cfg.cloud.api_key),
+        "cloud.model" => FieldValue::Str(&mut cfg.cloud.model),
         "gui.enabled" => FieldValue::Bool(&mut cfg.gui.enabled),
         "gui.theme" => FieldValue::Str(&mut cfg.gui.theme),
         _ => return None,
@@ -184,6 +198,7 @@ pub fn sync_owned(d: &mut SettingsDraft, live: &Config) {
     }
     d.cfg.gui.theme = live.gui.theme.clone();
     d.cfg.audio.device = live.audio.device.clone();
+    d.cfg.audio.loopback_device = live.audio.loopback_device.clone();
     d.cfg.asr.model = live.asr.model.clone();
     d.cfg.asr.en_model = live.asr.en_model.clone();
 }
@@ -199,6 +214,11 @@ pub fn draft_check(cfg: &Config) -> (Vec<(String, String)>, Option<String>) {
     if let Err(e) = hotkey::parse_hotkey(&cfg.general.en_hotkey) {
         fields.push(("general.en_hotkey".into(), e.to_string()));
     }
+    if !cfg.general.interview_hotkey.is_empty() {
+        if let Err(e) = hotkey::parse_hotkey(&cfg.general.interview_hotkey) {
+            fields.push(("general.interview_hotkey".into(), e.to_string()));
+        }
+    }
     if !fields.is_empty() {
         // Config::validate stops at the first hotkey error; it would duplicate
         // the message already attributed above.
@@ -211,6 +231,10 @@ pub fn draft_check(cfg: &Config) -> (Vec<(String, String)>, Option<String>) {
             // "hotkey and en_hotkey must differ" concerns both rows.
             if msg.contains("hotkey and general.en_hotkey must differ") {
                 fields.push(("general.en_hotkey".into(), msg));
+                return (fields, None);
+            }
+            if msg.contains("general.interview_hotkey must differ") {
+                fields.push(("general.interview_hotkey".into(), msg));
                 return (fields, None);
             }
             (fields, Some(msg))

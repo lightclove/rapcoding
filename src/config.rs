@@ -15,6 +15,7 @@ pub struct Config {
     pub asr: Asr,
     pub text: Text,
     pub inject: Inject,
+    pub cloud: Cloud,
     pub gui: Gui,
 }
 
@@ -24,6 +25,9 @@ pub struct General {
     pub mode: String,
     pub hotkey: String,
     pub en_hotkey: String,
+    /// Third binding: mixed capture (all inputs + loopback) → cloud ASR.
+    /// Empty = feature disabled (the binding is not registered).
+    pub interview_hotkey: String,
     pub max_record_secs: u64,
     pub log_transcripts: bool,
 }
@@ -32,6 +36,9 @@ pub struct General {
 #[serde(default, deny_unknown_fields)]
 pub struct Audio {
     pub device: String,
+    /// Output (render) endpoint captured as WASAPI loopback for the interview
+    /// binding. Empty = the system default output device.
+    pub loopback_device: String,
     /// Deprecated: the ASR rate is fixed at 16 kHz (`asr::ASR_RATE`). Kept as a
     /// known-but-ignored field so configs written before 0.1.0 (which carried
     /// `sample_rate`) still parse instead of failing `deny_unknown_fields`.
@@ -73,6 +80,16 @@ pub struct Inject {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+pub struct Cloud {
+    /// OpenAI-compatible endpoint root, e.g. "https://api.groq.com/openai/v1".
+    pub base_url: String,
+    /// Empty = cloud disabled (interview binding not registered).
+    pub api_key: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Gui {
     pub enabled: bool,
     pub theme: String,
@@ -86,6 +103,7 @@ impl Default for Config {
             asr: Asr::default(),
             text: Text::default(),
             inject: Inject::default(),
+            cloud: Cloud::default(),
             gui: Gui::default(),
         }
     }
@@ -97,6 +115,7 @@ impl Default for General {
             mode: "hold".into(),
             hotkey: "ctrl+alt+space".into(),
             en_hotkey: "ctrl+win+alt+space".into(),
+            interview_hotkey: "ctrl+alt+shift+space".into(),
             max_record_secs: 120,
             log_transcripts: false,
         }
@@ -107,6 +126,7 @@ impl Default for Audio {
     fn default() -> Self {
         Audio {
             device: String::new(),
+            loopback_device: String::new(),
             sample_rate: None,
             silence_threshold: 0.008,
             silence_padding_ms: 200,
@@ -147,6 +167,16 @@ impl Default for Inject {
     }
 }
 
+impl Default for Cloud {
+    fn default() -> Self {
+        Cloud {
+            base_url: "https://api.groq.com/openai/v1".into(),
+            api_key: String::new(),
+            model: "whisper-large-v3".into(),
+        }
+    }
+}
+
 impl Default for Gui {
     fn default() -> Self {
         Gui {
@@ -178,6 +208,16 @@ impl Config {
                 "general.hotkey and general.en_hotkey must differ".into(),
             ));
         }
+        if !self.general.interview_hotkey.is_empty() {
+            crate::hotkey::parse_hotkey(&self.general.interview_hotkey)?;
+            for other in [&self.general.hotkey, &self.general.en_hotkey] {
+                if &self.general.interview_hotkey == other {
+                    return Err(Error::Config(format!(
+                        "general.interview_hotkey must differ from {other}"
+                    )));
+                }
+            }
+        }
         if !(0.0..1.0).contains(&self.audio.silence_threshold) {
             return Err(Error::Config(
                 "audio.silence_threshold must be in [0, 1)".into(),
@@ -190,6 +230,23 @@ impl Config {
         }
         if self.audio.min_speech_ms > 60_000 {
             return Err(Error::Config("audio.min_speech_ms must be <= 60000".into()));
+        }
+        // Cloud: an API key without a base URL is a misconfiguration; a set
+        // base URL with an empty key is valid (default = cloud disabled).
+        if !self.cloud.api_key.trim().is_empty() && self.cloud.base_url.trim().is_empty() {
+            return Err(Error::Config(
+                "cloud.base_url must be set when cloud.api_key is set".into(),
+            ));
+        }
+        if !self.cloud.base_url.trim().is_empty() && !self.cloud.base_url.starts_with("http") {
+            return Err(Error::Config(
+                "cloud.base_url must start with http(s)://".into(),
+            ));
+        }
+        if !self.cloud.api_key.trim().is_empty() && self.cloud.model.trim().is_empty() {
+            return Err(Error::Config(
+                "cloud.model must be set when cloud.api_key is set".into(),
+            ));
         }
         if !matches!(
             self.text.voice_commands.as_str(),
@@ -802,6 +859,68 @@ mod tests {
         let mut c = Config::default();
         c.general.en_hotkey = c.general.hotkey.clone();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn interview_hotkey_empty_means_off_and_valid() {
+        let mut c = Config::default();
+        c.general.interview_hotkey = String::new();
+        c.validate().expect("empty interview hotkey = feature off");
+    }
+
+    #[test]
+    fn interview_hotkey_invalid_rejected() {
+        let mut c = Config::default();
+        c.general.interview_hotkey = "ctrl+space+alt".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn interview_hotkey_duplicate_rejected() {
+        let mut c = Config::default();
+        c.general.interview_hotkey = c.general.hotkey.clone();
+        assert!(c.validate().is_err(), "must differ from hotkey");
+        c.general.interview_hotkey = c.general.en_hotkey.clone();
+        assert!(c.validate().is_err(), "must differ from en_hotkey");
+    }
+
+    #[test]
+    fn cloud_key_without_url_rejected() {
+        let mut c = Config::default();
+        c.cloud.api_key = "k".into();
+        c.cloud.base_url = String::new();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn cloud_url_without_key_is_valid_and_disabled() {
+        let mut c = Config::default();
+        c.cloud.api_key = String::new();
+        c.validate().expect("default state (url set, key empty) must stay valid");
+    }
+
+    #[test]
+    fn cloud_key_without_model_rejected() {
+        let mut c = Config::default();
+        c.cloud.api_key = "k".into();
+        c.cloud.model = String::new();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn cloud_url_must_be_http() {
+        let mut c = Config::default();
+        c.cloud.api_key = "k".into();
+        c.cloud.base_url = "ftp://x".into();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_config_without_cloud_parses() {
+        let s = "[general]\nmode = \"hold\"\n";
+        let cfg: Config = toml::from_str(s).unwrap();
+        assert_eq!(cfg.cloud, Cloud::default());
+        assert_eq!(cfg.audio.loopback_device, "");
     }
 
     #[test]

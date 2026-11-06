@@ -8,6 +8,7 @@
 
 mod asr;
 mod audio;
+mod cloud;
 mod config;
 #[cfg(feature = "gui")]
 mod download;
@@ -163,6 +164,19 @@ enum Lang {
     En,
 }
 
+/// Id of the interview binding (mixed capture + cloud ASR). Ids 0/1 are the
+/// RU/EN microphone bindings (`Lang`).
+const INTERVIEW_ID: usize = 2;
+
+/// User-facing label of a hotkey id (log/status).
+fn hotkey_label(id: usize) -> &'static str {
+    match id {
+        0 | 1 => Lang::of(id).name(),
+        INTERVIEW_ID => "mixed",
+        other => unreachable!("unknown hotkey id {other}"),
+    }
+}
+
 impl Lang {
     fn of(id: usize) -> Self {
         match id {
@@ -298,6 +312,11 @@ struct Daemon {
     busy: Arc<AtomicBool>,
     en: Arc<Mutex<Option<asr::VoskAsr>>>,
     status: Arc<Mutex<Status>>,
+    /// Mixed capture (all inputs + loopback) for the interview binding.
+    /// None when the interview binding was not registered (degraded).
+    mixed: Option<audio::MultiCapture>,
+    /// Cloud ASR for the interview binding; None when not configured.
+    cloud: Option<cloud::CloudAsr>,
 }
 
 impl Daemon {
@@ -342,7 +361,7 @@ impl Daemon {
         } else {
             None
         };
-        let audio = audio::AudioCapture::new_with_sink(&init.audio.device, err_sink)?;
+        let audio = audio::AudioCapture::new_with_sink(&init.audio.device, err_sink.clone())?;
         logger.info(&format!(
             "audio device '{}' {} Hz {} ch",
             audio.device_name(),
@@ -377,8 +396,38 @@ impl Daemon {
             init.inject.settle_ms,
         )?;
 
+        // Interview binding: mixed capture (all inputs + loopback) → cloud
+        // ASR. Any missing piece degrades loudly (warning + the binding is
+        // simply not registered); the regular hotkeys are unaffected (OQ-4).
+        let mut mixed = None;
+        let mut cloud_asr = None;
+        if !init.general.interview_hotkey.is_empty() {
+            match cloud::CloudAsr::new(&init.cloud) {
+                Ok(c) => {
+                    cloud_asr = Some(c);
+                    match audio::MultiCapture::open_all(
+                        &init.audio.loopback_device,
+                        err_sink.clone(),
+                    ) {
+                        Ok(m) => mixed = Some(m),
+                        Err(e) => logger.warn(&format!(
+                            "interview capture unavailable: {e} — hotkey '{}' not registered",
+                            init.general.interview_hotkey
+                        )),
+                    }
+                }
+                Err(e) => logger.warn(&format!(
+                    "cloud asr unavailable: {e} — hotkey '{}' not registered",
+                    init.general.interview_hotkey
+                )),
+            }
+        }
+
         let (hot_tx, hot_rx) = mpsc::channel::<hotkey::HotMsg>();
-        let bindings = vec![init.general.hotkey.clone(), init.general.en_hotkey.clone()];
+        let mut bindings = vec![init.general.hotkey.clone(), init.general.en_hotkey.clone()];
+        if mixed.is_some() && cloud_asr.is_some() {
+            bindings.push(init.general.interview_hotkey.clone());
+        }
         let hotkeys = hotkey::spawn_hotkeys(&bindings, hot_tx)?;
         for b in &bindings {
             logger.info(&format!(
@@ -403,11 +452,86 @@ impl Daemon {
             busy: Arc::new(AtomicBool::new(false)),
             en: Arc::new(Mutex::new(None::<asr::VoskAsr>)),
             status,
+            mixed,
+            cloud: cloud_asr,
         })
     }
 
     fn set_status(&self, s: Status) {
         *sync::lock_recover(&self.status) = s;
+    }
+
+    /// Begin recording on the capture matching the hotkey id. Returns false
+    /// (with a loud warning) when the interview capture is unavailable — the
+    /// binding is then not registered, so this is a defensive path only.
+    fn start_capture(&self, id: usize) -> bool {
+        if id == INTERVIEW_ID {
+            match &self.mixed {
+                Some(m) => {
+                    m.start();
+                    true
+                }
+                None => {
+                    self.logger.warn("interview capture unavailable — ignored");
+                    false
+                }
+            }
+        } else {
+            self.audio.start();
+            true
+        }
+    }
+
+    /// Stop recording and return the samples (mixed at 16 kHz for the
+    /// interview binding, native device rate otherwise).
+    fn stop_capture(&self, id: usize) -> Vec<f32> {
+        if id == INTERVIEW_ID {
+            self.mixed.as_ref().map(|m| m.stop()).unwrap_or_default()
+        } else {
+            self.audio.stop()
+        }
+    }
+
+    fn capture_elapsed(&self, id: usize) -> Option<Duration> {
+        if id == INTERVIEW_ID {
+            self.mixed.as_ref().and_then(|m| m.elapsed())
+        } else {
+            self.audio.elapsed()
+        }
+    }
+
+    fn finish_capture(&self, id: usize) {
+        let samples = self.stop_capture(id);
+        if id == INTERVIEW_ID {
+            self.dispatch_mixed(samples);
+        } else {
+            self.dispatch(samples, Lang::of(id));
+        }
+    }
+
+    /// Cloud path: samples are already mixed at 16 kHz, so the worker skips
+    /// the vosk resample; trim/postprocess/inject are shared.
+    fn dispatch_mixed(&self, samples: Vec<f32>) {
+        if samples.is_empty() {
+            return;
+        }
+        let Some(cloud) = self.cloud.clone() else {
+            self.logger
+                .warn("cloud asr unavailable — interview transcript skipped");
+            return;
+        };
+        self.busy.store(true, Ordering::Relaxed);
+        self.set_status(Status::Transcribing("mixed"));
+        self.logger.info("transcribing… (mixed, cloud)");
+        let cfg = sync::read_recover(&self.cfg).clone();
+        spawn_cloud_worker(
+            samples,
+            cloud,
+            cfg,
+            self.injector.clone(),
+            self.logger.clone(),
+            self.work_tx.clone(),
+        );
     }
 
     fn dispatch(&self, samples: Vec<f32>, lang: Lang) {
@@ -451,33 +575,27 @@ impl Daemon {
                         (Mode::Hold, hotkey::HotEvent::Pressed) => {
                             if self.busy.load(Ordering::Relaxed) {
                                 self.logger.warn("busy: ignoring hotkey");
-                            } else if recording.is_none() {
-                                self.audio.start();
+                            } else if recording.is_none() && self.start_capture(id) {
                                 recording = Some(id);
-                                self.set_status(Status::Listening(Lang::of(id).name()));
-                                self.logger
-                                    .info(&format!("listening ({})", Lang::of(id).name()));
+                                self.set_status(Status::Listening(hotkey_label(id)));
+                                self.logger.info(&format!("listening ({})", hotkey_label(id)));
                             }
                         }
                         (Mode::Hold, hotkey::HotEvent::Released) => {
                             if recording == Some(id) {
                                 recording = None;
-                                let samples = self.audio.stop();
-                                self.dispatch(samples, Lang::of(id));
+                                self.finish_capture(id);
                             }
                         }
                         (Mode::Toggle, hotkey::HotEvent::Pressed) => {
                             if let Some(start_id) = recording.take() {
-                                let samples = self.audio.stop();
-                                self.dispatch(samples, Lang::of(start_id));
+                                self.finish_capture(start_id);
                             } else if self.busy.load(Ordering::Relaxed) {
                                 self.logger.warn("busy: ignoring hotkey");
-                            } else {
-                                self.audio.start();
+                            } else if self.start_capture(id) {
                                 recording = Some(id);
-                                self.set_status(Status::Listening(Lang::of(id).name()));
-                                self.logger
-                                    .info(&format!("listening ({})", Lang::of(id).name()));
+                                self.set_status(Status::Listening(hotkey_label(id)));
+                                self.logger.info(&format!("listening ({})", hotkey_label(id)));
                             }
                         }
                         (_, hotkey::HotEvent::Released) => {}
@@ -507,15 +625,14 @@ impl Daemon {
             // Auto-stop runaway recordings. The limit is read live from the
             // shared config: a settings change applies without a restart.
             if let Some(start_id) = recording {
-                if let Some(el) = self.audio.elapsed() {
+                if let Some(el) = self.capture_elapsed(start_id) {
                     let max = Duration::from_secs(
                         sync::read_recover(&self.cfg).general.max_record_secs.max(1),
                     );
                     if el >= max {
                         recording = None;
                         self.logger.info("auto-stop at max duration");
-                        let samples = self.audio.stop();
-                        self.dispatch(samples, Lang::of(start_id));
+                        self.finish_capture(start_id);
                     }
                 }
             }
@@ -641,7 +758,17 @@ fn process_utterance(
         }
     };
     let asr_ms = t0.elapsed();
+    finish_utterance(raw, asr_ms, cfg, injector, logger)
+}
 
+/// Postprocess + inject, shared by the local (vosk) and cloud paths.
+fn finish_utterance(
+    raw: String,
+    asr_ms: Duration,
+    cfg: &config::Config,
+    injector: &inject::Injector,
+    logger: &Logger,
+) -> WorkResult {
     let text = text::postprocess(
         &raw,
         &cfg.text.voice_commands,
@@ -670,6 +797,73 @@ fn process_utterance(
         inject_ms,
         message: note,
     }
+}
+
+fn spawn_cloud_worker(
+    samples: Vec<f32>,
+    cloud: cloud::CloudAsr,
+    cfg: config::Config,
+    injector: inject::Injector,
+    logger: Logger,
+    tx: Sender<WorkResult>,
+) {
+    std::thread::spawn(move || {
+        lower_worker_priority();
+        // Always deliver a result so `busy` is never left stuck by a panic.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_utterance_cloud(&samples, &cloud, &cfg, &injector, &logger)
+        }))
+        .unwrap_or_else(|payload| {
+            let msg = panic_message(&payload);
+            logger.warn(&format!("worker {msg}"));
+            fail(msg)
+        });
+        let _ = tx.send(result);
+    });
+}
+
+/// Interview (cloud) path: samples arrive already mixed at 16 kHz mono, so
+/// there is no resample; trim, thresholds, postprocess and inject are shared
+/// with the local path. Network/HTTP failures are loud errors — `busy` is
+/// released by the worker result, and nothing is typed.
+fn process_utterance_cloud(
+    samples: &[f32],
+    cloud: &cloud::CloudAsr,
+    cfg: &config::Config,
+    injector: &inject::Injector,
+    logger: &Logger,
+) -> WorkResult {
+    let target = asr::ASR_RATE;
+    let pad = (cfg.audio.silence_padding_ms as usize * target as usize) / 1000;
+    let speech = audio::trim_silence(samples, cfg.audio.silence_threshold, pad);
+    let min_samples = (cfg.audio.min_speech_ms as usize * target as usize) / 1000;
+    if speech.len() < min_samples {
+        let ms = speech.len() * 1000 / target as usize;
+        return WorkResult {
+            ok: false,
+            text_len: 0,
+            asr_ms: Duration::ZERO,
+            inject_ms: Duration::ZERO,
+            message: format!("too little speech ({ms} ms), ignored"),
+        };
+    }
+
+    let peak = speech.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    logger.info(&format!(
+        "captured {} ms audio, peak {:.3}",
+        speech.len() * 1000 / target as usize,
+        peak
+    ));
+
+    let t0 = Instant::now();
+    let raw = match cloud.transcribe(&speech) {
+        Ok(s) => s,
+        Err(e) => {
+            return fail(format!("cloud: {e}"));
+        }
+    };
+    let asr_ms = t0.elapsed();
+    finish_utterance(raw, asr_ms, cfg, injector, logger)
 }
 
 fn fail(message: String) -> WorkResult {
@@ -721,6 +915,20 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
             ok = false;
         }
     }
+    if cfg.general.interview_hotkey.is_empty() {
+        println!("  note: interview hotkey disabled (general.interview_hotkey is empty)");
+    } else {
+        match hotkey::parse_hotkey(&cfg.general.interview_hotkey) {
+            Ok(_) => println!(
+                "  ok: general.interview_hotkey = {}",
+                cfg.general.interview_hotkey
+            ),
+            Err(e) => {
+                println!("  FAIL: {e}");
+                ok = false;
+            }
+        }
+    }
     if cfg.inject.paste_shortcut.is_empty() {
         println!("  ok: inject.paste_shortcut = platform default");
     } else {
@@ -747,6 +955,35 @@ fn cmd_check(override_path: Option<&Path>) -> Result<i32> {
             println!("  FAIL: {e}");
             ok = false;
         }
+    }
+
+    // Interview binding: needs a non-empty hotkey, a cloud key, and a
+    // capturable loopback stream. Opening the stream here proves it works.
+    let interview_on = !cfg.general.interview_hotkey.is_empty()
+        && !cfg.cloud.api_key.trim().is_empty();
+    if interview_on {
+        match audio::AudioCapture::new_loopback_with_sink(&cfg.audio.loopback_device, None) {
+            Ok(a) => println!(
+                "  ok: loopback device '{}' {} Hz {} ch",
+                a.device_name(),
+                a.device_rate(),
+                a.channels()
+            ),
+            Err(e) => {
+                println!("  FAIL: {e}");
+                ok = false;
+            }
+        }
+    } else {
+        println!("  note: interview binding off (empty hotkey or cloud.api_key)");
+    }
+    if cfg.cloud.api_key.trim().is_empty() {
+        println!("  note: cloud ASR disabled (cloud.api_key is empty)");
+    } else {
+        println!(
+            "  ok: cloud ASR configured ({} / {})",
+            cfg.cloud.base_url, cfg.cloud.model
+        );
     }
 
     match asr::VoskAsr::new(&config::resolve_model_path_in(

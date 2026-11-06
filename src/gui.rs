@@ -1148,6 +1148,13 @@ impl GuiApp {
                         .add(egui::TextEdit::singleline(v).desired_width(w))
                         .changed();
                 }
+                (WidgetKind::Secret, FieldValue::Str(v)) => {
+                    // API key: masked on screen; the stored value never echoes.
+                    let w = ui.available_width().min(320.0);
+                    changed = ui
+                        .add(egui::TextEdit::singleline(v).password(true).desired_width(w))
+                        .changed();
+                }
                 (WidgetKind::Dir, FieldValue::Str(v)) => {
                     // Narrow window: text + «Выбрать…» + «Сброс» must fit
                     // next to the label column (min window is 760 px).

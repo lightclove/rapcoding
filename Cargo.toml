@@ -8,7 +8,7 @@ license = "MIT"
 
 [features]
 default = []
-gui = ["dep:eframe", "dep:rfd", "dep:ureq", "dep:zip", "dep:image"]
+gui = ["dep:eframe", "dep:rfd", "dep:zip", "dep:image"]
 
 [dependencies]
 arboard = { version = "3.7", default-features = false }
@@ -20,10 +20,11 @@ global-hotkey = "0.9"
 image = { version = "0.25", optional = true }
 rfd = { version = "0.15", optional = true }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 toml = "0.8"
-ureq = { version = "2", optional = true }
+ureq = "2"
 vosk = "0.3"
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 

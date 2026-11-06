@@ -2,35 +2,41 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
+/// Encode mono 16 kHz 16-bit PCM WAV into memory (cloud upload; tests).
+pub fn wav_bytes(samples: &[f32]) -> Vec<u8> {
+    use std::io::Write;
+    let n = samples.len();
+    let data_len = (n * 2) as u32;
+    let mut w: Vec<u8> = Vec::with_capacity(44 + n * 2);
+
+    w.write_all(b"RIFF").unwrap();
+    w.write_all(&(36 + data_len).to_le_bytes()).unwrap();
+    w.write_all(b"WAVE").unwrap();
+
+    w.write_all(b"fmt ").unwrap();
+    w.write_all(&16u32.to_le_bytes()).unwrap(); // fmt chunk size
+    w.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
+    w.write_all(&1u16.to_le_bytes()).unwrap(); // mono
+    w.write_all(&crate::asr::ASR_RATE.to_le_bytes()).unwrap(); // sample rate
+    w.write_all(&(crate::asr::ASR_RATE * 2).to_le_bytes())
+        .unwrap(); // byte rate = rate * block_align
+    w.write_all(&2u16.to_le_bytes()).unwrap(); // block align
+    w.write_all(&16u16.to_le_bytes()).unwrap(); // bits per sample
+
+    w.write_all(b"data").unwrap();
+    w.write_all(&data_len.to_le_bytes()).unwrap();
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        w.write_all(&v.to_le_bytes()).unwrap();
+    }
+    w
+}
+
 /// Write mono 16 kHz 16-bit PCM WAV. Used by tests (the live pipeline feeds
 /// vosk samples directly, no WAV round-trip).
 #[cfg(test)]
 pub fn write_wav(path: &Path, samples: &[f32]) -> std::io::Result<()> {
-    use std::io::Write;
-    let n = samples.len();
-    let data_len = (n * 2) as u32;
-    let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-
-    w.write_all(b"RIFF")?;
-    w.write_all(&(36 + data_len).to_le_bytes())?;
-    w.write_all(b"WAVE")?;
-
-    w.write_all(b"fmt ")?;
-    w.write_all(&16u32.to_le_bytes())?; // fmt chunk size
-    w.write_all(&1u16.to_le_bytes())?; // PCM
-    w.write_all(&1u16.to_le_bytes())?; // mono
-    w.write_all(&crate::asr::ASR_RATE.to_le_bytes())?; // sample rate
-    w.write_all(&(crate::asr::ASR_RATE * 2).to_le_bytes())?; // byte rate = rate * block_align
-    w.write_all(&2u16.to_le_bytes())?; // block align
-    w.write_all(&16u16.to_le_bytes())?; // bits per sample
-
-    w.write_all(b"data")?;
-    w.write_all(&data_len.to_le_bytes())?;
-    for &s in samples {
-        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-        w.write_all(&v.to_le_bytes())?;
-    }
-    w.flush()
+    std::fs::write(path, wav_bytes(samples))
 }
 
 /// Read a PCM WAV file into mono f32 samples at 16 kHz.

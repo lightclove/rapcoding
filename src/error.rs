@@ -18,6 +18,9 @@ pub enum Error {
     #[error("asr: {0}")]
     Asr(String),
 
+    #[error("cloud: {0}")]
+    Cloud(String),
+
     #[error("hotkey: {0}")]
     Hotkey(String),
 
