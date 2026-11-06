@@ -86,7 +86,9 @@ impl CloudAsr {
             .timeout_connect(Duration::from_secs(20))
             .timeout_read(Duration::from_secs(120))
             .build();
-        let resp = agent
+        // ureq 2.x surfaces non-2xx as Error::Status already at send(); the
+        // response (with the provider's error body) is inside the error.
+        let resp = match agent
             .post(&url)
             .set("Authorization", &format!("Bearer {}", self.api_key))
             .set(
@@ -94,17 +96,20 @@ impl CloudAsr {
                 &format!("multipart/form-data; boundary={BOUNDARY}"),
             )
             .send(body.as_slice())
-            .map_err(|e| Error::Cloud(format!("POST {url}: {e}")))?;
-        let status = resp.status();
+        {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                return Err(Error::Cloud(format!(
+                    "HTTP {code}: {}",
+                    crate::log::sanitize(&clip(&body, 300))
+                )));
+            }
+            Err(e) => return Err(Error::Cloud(format!("POST {url}: {e}"))),
+        };
         let text = resp
             .into_string()
             .map_err(|e| Error::Cloud(format!("read response: {e}")))?;
-        if status != 200 {
-            return Err(Error::Cloud(format!(
-                "HTTP {status}: {}",
-                crate::log::sanitize(&clip(&text, 300))
-            )));
-        }
         parse_transcript(&text)
     }
 }
@@ -177,5 +182,87 @@ mod tests {
         // The key is not embedded in any error path here; verify only that it
         // round-trips into the client.
         assert_eq!(c.api_key, "k");
+    }
+
+    /// Minimal one-request HTTP server on localhost that answers with a fixed
+    /// status + body and records the request for the caller's assertions.
+    fn mock_server(status_line: &'static str, body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            // Read until the final multipart boundary arrives (TCP may split).
+            for _ in 0..100 {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf
+                            .windows(BOUNDARY.len() + 4)
+                            .any(|w| w == format!("--{BOUNDARY}--").as_bytes())
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let resp = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[test]
+    fn transcribe_roundtrip_against_local_mock() {
+        // The full HTTP path without any network: multipart POST to
+        // /audio/transcriptions, Bearer auth, JSON "text" extracted.
+        let (url, handle) = mock_server(
+            "HTTP/1.1 200 OK",
+            "{\"text\":\"  mock transcript  \"}",
+        );
+        let cfg = Cloud {
+            base_url: url,
+            api_key: "test-key".into(),
+            model: "mock-model".into(),
+        };
+        let asr = CloudAsr::new(&cfg).unwrap();
+        let samples = vec![0.01f32; 1600]; // 100 ms at 16 kHz
+        let text = asr.transcribe(&samples).expect("transcribe");
+        assert_eq!(text, "mock transcript");
+        let req = handle.join().expect("mock thread");
+        assert!(req.starts_with("POST /audio/transcriptions "), "{req}");
+        assert!(req.contains("Authorization: Bearer test-key"), "{req}");
+        assert!(req.contains("multipart/form-data; boundary="), "{req}");
+        assert!(req.contains("name=\"file\"; filename=\"audio.wav\""), "{req}");
+        assert!(req.contains("name=\"model\""), "{req}");
+        assert!(req.contains("mock-model"), "{req}");
+    }
+
+    #[test]
+    fn transcribe_reports_http_error_loudly() {
+        // A non-200 must be a loud error carrying the status, never a silent
+        // empty transcript.
+        let (url, handle) = mock_server(
+            "HTTP/1.1 401 Unauthorized",
+            "{\"error\":{\"message\":\"bad key\"}}",
+        );
+        let cfg = Cloud {
+            base_url: url,
+            api_key: "wrong".into(),
+            model: "m".into(),
+        };
+        let asr = CloudAsr::new(&cfg).unwrap();
+        let err = asr.transcribe(&[0.1f32; 1600]).expect_err("must fail");
+        assert!(err.to_string().contains("HTTP 401"), "{err}");
+        handle.join().expect("mock thread");
     }
 }

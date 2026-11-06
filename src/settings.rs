@@ -89,6 +89,30 @@ pub const SETTINGS_SECTIONS: &[(&str, &str)] = &[
     ("gui", "Интерфейс"),
 ];
 
+/// Why the interview binding is (or is not) active, derived from the config.
+/// The daemon's own degradation (a device that fails to open) is visible in
+/// the log — this only covers config-level causes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterviewState {
+    /// `general.interview_hotkey` is empty — the feature is off.
+    OffNoHotkey,
+    /// The cloud API key is empty — the binding is not registered.
+    OffNoKey,
+    /// Config complete; the daemon may still skip the binding when no device
+    /// opens (see the log page).
+    Ready,
+}
+
+pub fn interview_state(cfg: &Config) -> InterviewState {
+    if cfg.general.interview_hotkey.is_empty() {
+        InterviewState::OffNoHotkey
+    } else if cfg.cloud.api_key.trim().is_empty() {
+        InterviewState::OffNoKey
+    } else {
+        InterviewState::Ready
+    }
+}
+
 /// Live view of one config field, for the widgets.
 #[derive(Debug)]
 pub enum FieldValue<'a> {
@@ -474,6 +498,20 @@ mod tests {
             .collect();
         // Assert.
         assert_eq!(live, expected_live, "restart flags drifted from the spec");
+    }
+
+    #[test]
+    fn interview_state_reflects_config() {
+        let mut c = Config::default();
+        assert_eq!(interview_state(&c), InterviewState::OffNoKey);
+        c.cloud.api_key = "k".into();
+        assert_eq!(interview_state(&c), InterviewState::Ready);
+        c.general.interview_hotkey = String::new();
+        assert_eq!(interview_state(&c), InterviewState::OffNoHotkey);
+        // Whitespace-only key counts as empty.
+        let mut d = Config::default();
+        d.cloud.api_key = "  ".into();
+        assert_eq!(interview_state(&d), InterviewState::OffNoKey);
     }
 
     #[test]

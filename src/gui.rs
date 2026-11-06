@@ -643,22 +643,42 @@ impl GuiApp {
                 .show(ui, |ui| {
                     ui.label(RichText::new("Русский").size(13.0).color(p.muted));
                     ui.label(RichText::new("Английский").size(13.0).color(p.muted));
-                    ui.label("");
+                    ui.label(RichText::new("Интервью").size(13.0).color(p.muted));
                     ui.end_row();
-                    for (ru, en) in [(&self.cfg.general.hotkey, &self.cfg.general.en_hotkey)] {
+                    {
+                        let mix = if self.cfg.general.interview_hotkey.is_empty() {
+                            "—".to_string()
+                        } else {
+                            pretty_hotkey(&self.cfg.general.interview_hotkey)
+                        };
                         ui.label(
-                            RichText::new(pretty_hotkey(ru))
+                            RichText::new(pretty_hotkey(&self.cfg.general.hotkey))
                                 .monospace()
                                 .size(14.0)
                                 .color(p.text),
                         );
                         ui.label(
-                            RichText::new(pretty_hotkey(en))
+                            RichText::new(pretty_hotkey(&self.cfg.general.en_hotkey))
                                 .monospace()
                                 .size(14.0)
                                 .color(p.text),
                         );
-                        ui.label("");
+                        let mix_label = ui
+                            .label(
+                                RichText::new(mix)
+                                    .monospace()
+                                    .size(14.0)
+                                    .color(p.text),
+                            );
+                        if self.cfg.general.interview_hotkey.is_empty() {
+                            mix_label.on_hover_text(
+                                "Хоткей интервью не задан (general.interview_hotkey пуст) — режим выключен",
+                            );
+                        } else {
+                            mix_label.on_hover_text(
+                                "Пока держите: пишутся все микрофоны + системный звук, распознавание облаком",
+                            );
+                        }
                         ui.end_row();
                     }
                 });
@@ -827,17 +847,28 @@ impl GuiApp {
             };
         }
 
+        // Loopback source: the output device whose audio is recorded for the
+        // interview binding. Declared here so the persist block below the
+        // card sees the edits.
+        let out_names: Vec<String> = self.output_devices.iter().map(|d| d.name.clone()).collect();
+        let out_checked: Option<String> = audio::pick_index(&self.cfg.audio.loopback_device, &out_names)
+            .map(|i| out_names[i].clone());
+        let mut out_value = out_checked
+            .clone()
+            .unwrap_or_else(|| self.cfg.audio.loopback_device.clone());
+        let mut out_changed = false;
+
         ui.add_space(12.0);
         Self::card(ui, p, |ui| {
             ui.label(
-                RichText::new("Вывод (наушники/динамики)")
+                RichText::new("Системный звук для интервью (вывод)")
                     .size(16.0)
                     .strong()
                     .color(p.text),
             );
             ui.label(
                 RichText::new(
-                    "rapcoding ничего не воспроизводит — этот список только для справки. Устройство вывода по умолчанию меняется в Параметрах Windows: Система, Звук.",
+                    "Пока держите хоткей интервью, rapcoding пишет и этот вывод, и все микрофоны. Обычные хоткеи записывают только микрофон. Применяется после перезапуска.",
                 )
                 .size(12.5)
                 .color(p.muted),
@@ -850,18 +881,126 @@ impl GuiApp {
                         .color(p.warn),
                 );
             }
+            let default_out_name = self
+                .output_devices
+                .iter()
+                .find(|d| d.is_default)
+                .map(|d| d.name.as_str())
+                .unwrap_or("нет устройства");
+            let row = device_row(
+                ui,
+                p,
+                out_value.is_empty(),
+                &format!("Система по умолчанию — {default_out_name}"),
+                &[],
+            );
+            if row.clicked() {
+                out_value.clear();
+                out_changed = true;
+            }
             for d in &self.output_devices {
                 let suffix: &[(&str, Color32)] = if d.is_default {
                     &[("по умолчанию", p.accent)]
                 } else {
                     &[]
                 };
-                // Read-only row: same layout as the input list so long device
-                // names wrap instead of turning into overflow boxes.
-                let row = device_row(ui, p, false, &d.name, suffix);
+                let row = device_row(ui, p, out_value.as_str() == d.name.as_str(), &d.name, suffix);
                 let sum = d.summary();
+                let row = if sum.is_empty() {
+                    row
+                } else {
+                    row.on_hover_text(format!("{} — {sum}", d.name))
+                };
+                if row.clicked() {
+                    out_value = d.name.clone();
+                    out_changed = true;
+                }
+            }
+            if let Some(i) = audio::pick_index(&out_value, &out_names) {
+                let sum = self.output_devices[i].summary();
                 if !sum.is_empty() {
-                    row.on_hover_text(format!("{} — {sum}", d.name));
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("Формат записи: {sum}"))
+                            .size(12.0)
+                            .color(p.muted),
+                    );
+                }
+            }
+            if !self.cfg.audio.loopback_device.is_empty() && out_checked.is_none() {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Настроенное устройство «{}» сейчас не видно (отключено?). Пока оно не вернётся — хоткей интервью не будет зарегистрирован.",
+                        self.cfg.audio.loopback_device
+                    ))
+                    .size(12.0)
+                    .color(p.warn),
+                );
+            }
+            ui.add_space(6.0);
+            if ui
+                .button("Обновить список")
+                .on_hover_text("Перечитать устройства вывода (Bluetooth подключается и отключается)")
+                .clicked()
+            {
+                self.sound_page_dirty = true;
+            }
+        });
+
+        if out_changed && out_value != self.cfg.audio.loopback_device {
+            self.cfg.audio.loopback_device = out_value;
+            let what = if self.cfg.audio.loopback_device.is_empty() {
+                "system default".to_string()
+            } else {
+                format!("\"{}\"", self.cfg.audio.loopback_device)
+            };
+            self.journal
+                .append("config", &format!("audio loopback device -> {what}"));
+            self.persist_error = match config::save(&self.config_path, &self.cfg) {
+                Ok(()) => None,
+                Err(e) => Some(e.to_string()),
+            };
+        }
+
+        ui.add_space(12.0);
+        Self::card(ui, p, |ui| {
+            ui.label(
+                RichText::new("Хоткей интервью")
+                    .size(13.0)
+                    .strong()
+                    .color(p.info),
+            );
+            match settings::interview_state(&self.cfg) {
+                settings::InterviewState::OffNoHotkey => {
+                    ui.label(
+                        RichText::new(
+                            "Режим выключен: хоткей не задан (general.interview_hotkey пуст). Задайте его на странице «Настройки».",
+                        )
+                        .size(12.0)
+                        .color(p.warn),
+                    );
+                }
+                settings::InterviewState::OffNoKey => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Хоткей «{}» не зарегистрирован: облачный ключ не задан (страница «Настройки» → «Облачное распознавание»). Интервью распознаётся облаком — локальные модели смесь русского и английского не понимают.",
+                            pretty_hotkey(&self.cfg.general.interview_hotkey)
+                        ))
+                        .size(12.0)
+                        .color(p.warn),
+                    );
+                }
+                settings::InterviewState::Ready => {
+                    ui.label(
+                        RichText::new(format!(
+                            "Хоткей «{}»: пока держите — пишутся все микрофоны и системный звук, распознавание облаком «{}». Если устройство не открылось, причина — на странице «Лог».",
+                            pretty_hotkey(&self.cfg.general.interview_hotkey),
+                            self.cfg.cloud.model
+                        ))
+                        .size(12.0)
+                        .color(p.info),
+                    );
                 }
             }
         });
