@@ -220,11 +220,11 @@ pub fn sync_owned(d: &mut SettingsDraft, live: &Config) {
     if d.fresh {
         return;
     }
-    d.cfg.gui.theme = live.gui.theme.clone();
-    d.cfg.audio.device = live.audio.device.clone();
-    d.cfg.audio.loopback_device = live.audio.loopback_device.clone();
-    d.cfg.asr.model = live.asr.model.clone();
-    d.cfg.asr.en_model = live.asr.en_model.clone();
+    for id in ["gui.theme", "audio.device", "audio.loopback_device", "asr.model", "asr.en_model"] {
+        if !field_differs(&d.cfg, id, &d.baseline) {
+            copy_field(&mut d.cfg, live, id);
+        }
+    }
 }
 
 /// Validate a draft: hotkey syntax errors are attributed to their row;
@@ -591,6 +591,26 @@ mod tests {
     }
 
     #[test]
+    fn edited_models_survive_settings_save_and_reload() {
+        let mut live = Config::default();
+        let mut d = SettingsDraft::new(&live);
+        d.cfg.asr.model = "models/custom-ru".into();
+        d.cfg.asr.en_model = "models/custom-en".into();
+        d.cfg.cloud.model = "whisper-1".into();
+        live.audio.device = "New mic".into();
+        sync_owned(&mut d, &live);
+        d.cfg.validate().unwrap();
+        let path = tmp("edited-models");
+        config::save(&path, &d.cfg).unwrap();
+        let loaded = config::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(loaded.asr.model, "models/custom-ru");
+        assert_eq!(loaded.asr.en_model, "models/custom-en");
+        assert_eq!(loaded.cloud.model, "whisper-1");
+        assert_eq!(loaded.audio.device, "New mic");
+    }
+
+    #[test]
     fn sync_owned_respects_fresh_draft() {
         // Arrange: a fresh draft holds the file's values.
         let mut d = SettingsDraft::new(&Config::default());
@@ -609,16 +629,15 @@ mod tests {
         // Arrange.
         let mut d = SettingsDraft::new(&Config::default());
         d.cfg.general.max_record_secs = 42; // settings-owned edit
-        d.cfg.gui.theme = "dark".into(); // other-page field
         let mut live = Config::default();
-        live.gui.theme = "light".into();
+        live.gui.theme = "dark".into();
         live.audio.device = "Mic".into();
         live.asr.model = "m1".into();
         live.asr.en_model = "m2".into();
         // Act.
         sync_owned(&mut d, &live);
         // Assert.
-        assert_eq!(d.cfg.gui.theme, "light");
+        assert_eq!(d.cfg.gui.theme, "dark");
         assert_eq!(d.cfg.audio.device, "Mic");
         assert_eq!(d.cfg.asr.model, "m1");
         assert_eq!(d.cfg.asr.en_model, "m2");
