@@ -2264,13 +2264,12 @@ fn set_models_dir(draft: &mut SettingsDraft, new_dir: &str) -> Option<(usize, St
     for slot in [&mut draft.cfg.asr.model, &mut draft.cfg.asr.en_model] {
         let p = std::path::Path::new(slot.as_str());
         if !p.is_absolute() {
-            *slot = new_root.join(p).display().to_string();
+            let relative = p.strip_prefix("models").ok()
+                .filter(|path| !path.as_os_str().is_empty()).unwrap_or(p);
+            *slot = new_root.join(relative).display().to_string();
         }
     }
     draft.dirty = true;
-    draft.baseline.asr.model = draft.cfg.asr.model.clone();
-    draft.baseline.asr.en_model = draft.cfg.asr.en_model.clone();
-    draft.baseline.asr.models_dir = draft.cfg.asr.models_dir.clone();
     Some((
         moved,
         format!(
@@ -2783,7 +2782,17 @@ mod tests {
         // old default (which still contains them).
         let new_root = config::models_root(&d.cfg, &config::config_dir());
         assert!(std::path::Path::new(&d.cfg.asr.model).is_absolute());
-        assert!(std::path::Path::new(&d.cfg.asr.model).starts_with(&new_root));
+        let live = Config::default();
+        assert!(settings::external_change(&d, &live).is_none());
+        sync_owned(&mut d, &live);
+        let path = dir.join("config.toml");
+        config::save(&path, &d.cfg).unwrap();
+        let loaded = config::load(&path).unwrap();
+        assert_eq!(loaded.asr.models_dir, dir.display().to_string());
+        for (actual, original) in [(&loaded.asr.model, &live.asr.model), (&loaded.asr.en_model, &live.asr.en_model)] {
+            let relative = std::path::Path::new(original).strip_prefix("models").unwrap();
+            assert_eq!(std::path::Path::new(actual), new_root.join(relative));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
